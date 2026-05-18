@@ -1,0 +1,47 @@
+name: a100_40gb_pcie
+kind: gpu
+
+# Derived from EnergAIzer config/gpu/yz8.yaml.
+# Peak FLOPs are scaled from sm_max_freq=1410 MHz to the measured LUT
+# operating point sm_freq=900 MHz. Energy coefficients are first-pass values
+# derived from power_cap divided by the corresponding peak throughput.
+compute:
+  clock_hz: 9.0e8
+  vector_flops_per_s:
+    fp64: 6.191489361702128e12
+    fp32: 1.2446808510638299e13
+    bf16: 1.2446808510638299e13
+  tensor_flops_per_s:
+    fp64: 1.2446808510638299e13
+    tf32: 9.957446808510639e13
+    bf16: 1.9914893617021278e14
+    fp16: 1.9914893617021278e14
+    int8: 3.9829787234042556e14
+  vector_energy_j_per_flop:
+    fp64: 4.037800687285223e-11
+    fp32: 2.0085470085470086e-11
+    bf16: 2.0085470085470086e-11
+  tensor_energy_j_per_flop:
+    fp64: 2.0085470085470086e-11
+    tf32: 2.5106837606837607e-12
+    bf16: 1.2553418803418803e-12
+    fp16: 1.2553418803418803e-12
+    int8: 6.276709401709402e-13
+
+memory:
+  levels:
+    - name: l2
+      size_bytes: 41943040
+      bandwidth_bytes_per_s: 4.608e12
+      energy_j_per_byte: 5.425347222222222e-11
+    - name: hbm
+      size_bytes: 42949672960
+      bandwidth_bytes_per_s: 1.555e12
+      energy_j_per_byte: 1.607717041800643e-10
+
+utilization:
+  vector: 1.0
+  tensor: 1.0
+  memory:
+    hbm: 1.0
+    l2: 1.0

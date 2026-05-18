@@ -1,0 +1,41 @@
+name: a10
+kind: gpu
+
+# Derived from EnergAIzer config/gpu/a10.yaml.
+# Peak FLOPs are scaled from sm_max_freq=1695 MHz to the measured LUT
+# operating point sm_freq=900 MHz. Energy coefficients are first-pass values
+# derived from power_cap divided by the corresponding peak throughput.
+compute:
+  clock_hz: 9.0e8
+  vector_flops_per_s:
+    fp32: 1.6566371681415932e13
+    bf16: 1.6566371681415932e13
+    fp16: 1.6566371681415932e13
+  tensor_flops_per_s:
+    bf16: 6.637168141592921e13
+    fp16: 6.637168141592921e13
+  vector_energy_j_per_flop:
+    fp32: 9.054487179487179e-12
+    bf16: 9.054487179487179e-12
+    fp16: 9.054487179487179e-12
+  tensor_energy_j_per_flop:
+    bf16: 2.2599999999999997e-12
+    fp16: 2.2599999999999997e-12
+
+memory:
+  levels:
+    - name: l2
+      size_bytes: 6291456
+      bandwidth_bytes_per_s: 4.608e12
+      energy_j_per_byte: 3.2552083333333334e-11
+    - name: hbm
+      size_bytes: 25769803776
+      bandwidth_bytes_per_s: 6.0e11
+      energy_j_per_byte: 2.5e-10
+
+utilization:
+  vector: 1.0
+  tensor: 1.0
+  memory:
+    hbm: 1.0
+    l2: 1.0

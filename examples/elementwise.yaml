@@ -1,0 +1,12 @@
+name: gelu
+kind: elementwise
+phase: train_fwd
+attrs:
+  op_count_per_element: 8
+tensors:
+  - role: input
+    shape: [4096, 8192]
+    dtype: bf16
+  - role: output
+    shape: [4096, 8192]
+    dtype: bf16

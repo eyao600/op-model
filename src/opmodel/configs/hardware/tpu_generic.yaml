@@ -1,0 +1,40 @@
+name: generic_tpu
+kind: tpu
+
+compute:
+  clock_hz: 1.0e9
+  vector_flops_per_s:
+    fp32: 1.0e13
+    bf16: 1.0e13
+  tensor_flops_per_s:
+    bf16: 7.5e14
+    fp16: 6.0e14
+  vector_energy_j_per_flop:
+    fp32: 1.5e-12
+    bf16: 8.0e-13
+  tensor_energy_j_per_flop:
+    bf16: 4.0e-13
+    fp16: 4.5e-13
+
+memory:
+  levels:
+    - name: register
+      size_bytes: 131072
+      bandwidth_bytes_per_s: 1.5e13
+      energy_j_per_byte: 1.0e-13
+    - name: sram
+      size_bytes: 33554432
+      bandwidth_bytes_per_s: 8.0e12
+      energy_j_per_byte: 4.0e-13
+    - name: hbm
+      size_bytes: 34359738368
+      bandwidth_bytes_per_s: 1.5e12
+      energy_j_per_byte: 1.2e-11
+
+utilization:
+  vector: 0.50
+  tensor: 0.70
+  memory:
+    hbm: 0.80
+    sram: 0.75
+    register: 1.0

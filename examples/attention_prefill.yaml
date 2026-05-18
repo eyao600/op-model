@@ -1,0 +1,27 @@
+name: self_attention
+kind: attention_prefill
+phase: prefill
+attrs:
+  batch: 1
+  seq_q: 2048
+  seq_kv: 2048
+  heads: 32
+  head_dim: 128
+  causal: true
+  flash_attention: true
+tensors:
+  - role: input
+    shape: [1, 32, 2048, 128]
+    dtype: bf16
+    layout: q
+  - role: input
+    shape: [1, 32, 2048, 128]
+    dtype: bf16
+    layout: k
+  - role: input
+    shape: [1, 32, 2048, 128]
+    dtype: bf16
+    layout: v
+  - role: output
+    shape: [1, 32, 2048, 128]
+    dtype: bf16

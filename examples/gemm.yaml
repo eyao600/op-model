@@ -1,0 +1,16 @@
+name: mlp_up_projection
+kind: gemm
+phase: train_fwd
+attrs:
+  transpose_a: false
+  transpose_b: false
+tensors:
+  - role: input
+    shape: [4096, 8192]
+    dtype: bf16
+  - role: weight
+    shape: [8192, 32768]
+    dtype: bf16
+  - role: output
+    shape: [4096, 32768]
+    dtype: bf16
