@@ -30,22 +30,23 @@ from opmodel.ops import (
 
 
 class RooflineModel(DispatchingOpModel):
-    def __init__(self) -> None:
-        super().__init__(
-            {
-                OpKind.GEMM: GemmEstimator(),
-                OpKind.BATCHED_GEMM: BatchedGemmEstimator(),
-                OpKind.ATTENTION_PREFILL: AttentionEstimator(prefill=True),
-                OpKind.ATTENTION_DECODE: AttentionEstimator(prefill=False),
-                OpKind.SOFTMAX: SoftmaxEstimator(),
-                OpKind.LAYERNORM: NormEstimator(layernorm=True),
-                OpKind.RMSNORM: NormEstimator(layernorm=False),
-                OpKind.ELEMENTWISE: ElementwiseEstimator(),
-                OpKind.REDUCTION: ReductionEstimator(),
-                OpKind.EMBEDDING: EmbeddingEstimator(),
-                OpKind.COPY: CopyEstimator(),
-            }
-        )
+    def __init__(self, estimator_overrides: dict[OpKind, Any] | None = None) -> None:
+        estimators = {
+            OpKind.GEMM: GemmEstimator(),
+            OpKind.BATCHED_GEMM: BatchedGemmEstimator(),
+            OpKind.ATTENTION_PREFILL: AttentionEstimator(prefill=True),
+            OpKind.ATTENTION_DECODE: AttentionEstimator(prefill=False),
+            OpKind.SOFTMAX: SoftmaxEstimator(),
+            OpKind.LAYERNORM: NormEstimator(layernorm=True),
+            OpKind.RMSNORM: NormEstimator(layernorm=False),
+            OpKind.ELEMENTWISE: ElementwiseEstimator(),
+            OpKind.REDUCTION: ReductionEstimator(),
+            OpKind.EMBEDDING: EmbeddingEstimator(),
+            OpKind.COPY: CopyEstimator(),
+        }
+        if estimator_overrides:
+            estimators.update(estimator_overrides)
+        super().__init__(estimators)
 
 
 class GemmEstimator:
@@ -284,33 +285,42 @@ def _make_profile(
     hardware: HardwareSpec,
     dtype: DType,
     flops: float,
-    hbm_read: int,
-    hbm_write: int,
+    hbm_read: int = 0,
+    hbm_write: int = 0,
+    memory_access: MemoryAccess | None = None,
     engine: EngineKind,
     footprint: GlobalFootprint,
     implementation: str,
+    compute_utilization_override: float | None = None,
     diagnostics: dict[str, Any] | None = None,
 ) -> OpProfile:
+    if memory_access is None:
+        memory_access = MemoryAccess(hbm_read_bytes=hbm_read, hbm_write_bytes=hbm_write)
     hbm_bw = _effective_hbm_bandwidth(hardware)
-    memory_latency = (hbm_read + hbm_write) / hbm_bw
-    effective_flops = _effective_flops(dtype, engine, hardware)
+    level_latencies = _memory_latencies(memory_access, hardware)
+    memory_latency = max(level_latencies.values(), default=0.0)
+    effective_flops = _effective_flops(
+        dtype, engine, hardware, compute_utilization_override=compute_utilization_override
+    )
     compute_latency = 0.0 if flops == 0.0 else flops / effective_flops
-    latency = max(compute_latency, memory_latency)
-    memory_access = MemoryAccess(hbm_read_bytes=hbm_read, hbm_write_bytes=hbm_write)
+    roofline_latency = max(compute_latency, memory_latency)
+    latency = hardware.kernel_launch_overhead_s + roofline_latency
     energy_breakdown = estimate_energy(
         flops=flops,
-        hbm_read_bytes=hbm_read,
-        hbm_write_bytes=hbm_write,
+        memory_access=memory_access,
         engine=engine,
         dtype=dtype,
         hardware=hardware,
     )
-    traffic = hbm_read + hbm_write
+    traffic = _total_memory_traffic(memory_access)
     base_diagnostics = {
         "compute_latency_s": compute_latency,
         "memory_latency_s": memory_latency,
+        "roofline_latency_s": roofline_latency,
+        "kernel_launch_overhead_s": hardware.kernel_launch_overhead_s,
         "effective_flops_per_s": effective_flops,
         "effective_hbm_bandwidth_bytes_per_s": hbm_bw,
+        "memory_level_latencies_s": level_latencies,
         "arithmetic_intensity_flops_per_byte": (flops / traffic) if traffic else None,
     }
     if diagnostics:
@@ -329,18 +339,72 @@ def _make_profile(
 
 
 def _effective_hbm_bandwidth(hardware: HardwareSpec) -> float:
-    hbm = hardware.memory_levels["hbm"]
-    return hbm.bandwidth_bytes_per_s * hardware.utilization.memory.get("hbm", 1.0)
+    return _effective_memory_bandwidth("hbm", hardware)
 
 
-def _effective_flops(dtype: DType, engine: EngineKind, hardware: HardwareSpec) -> float:
+def _effective_flops(
+    dtype: DType,
+    engine: EngineKind,
+    hardware: HardwareSpec,
+    *,
+    compute_utilization_override: float | None = None,
+) -> float:
     if engine == EngineKind.TENSOR:
-        return hardware.compute.tensor_flops_per_s[dtype] * hardware.utilization.tensor
+        utilization = (
+            hardware.utilization.tensor
+            if compute_utilization_override is None
+            else compute_utilization_override
+        )
+        return hardware.compute.tensor_flops_per_s[dtype] * utilization
     if engine == EngineKind.VECTOR:
-        return hardware.compute.vector_flops_per_s[dtype] * hardware.utilization.vector
+        utilization = (
+            hardware.utilization.vector
+            if compute_utilization_override is None
+            else compute_utilization_override
+        )
+        return hardware.compute.vector_flops_per_s[dtype] * utilization
     if engine == EngineKind.MEMORY:
         return float("inf")
     raise ValueError(f"Unsupported engine for v0 roofline latency: {engine}")
+
+
+def _memory_latencies(memory_access: MemoryAccess, hardware: HardwareSpec) -> dict[str, float]:
+    latencies: dict[str, float] = {}
+    for name, read_bytes, write_bytes in (
+        ("hbm", memory_access.hbm_read_bytes, memory_access.hbm_write_bytes),
+        ("l2", memory_access.l2_read_bytes, memory_access.l2_write_bytes),
+        ("sram", memory_access.sram_read_bytes, memory_access.sram_write_bytes),
+        ("register", memory_access.register_read_bytes, memory_access.register_write_bytes),
+    ):
+        total_bytes = (read_bytes or 0) + (write_bytes or 0)
+        level = hardware.memory_levels.get(name)
+        if total_bytes == 0 or level is None:
+            continue
+        latencies[name] = (
+            total_bytes / _effective_memory_bandwidth(name, hardware) + level.latency_s
+        )
+    return latencies
+
+
+def _effective_memory_bandwidth(name: str, hardware: HardwareSpec) -> float:
+    level = hardware.memory_levels[name]
+    return level.bandwidth_bytes_per_s * hardware.utilization.memory.get(name, 1.0)
+
+
+def _total_memory_traffic(memory_access: MemoryAccess) -> int:
+    return sum(
+        value or 0
+        for value in (
+            memory_access.hbm_read_bytes,
+            memory_access.hbm_write_bytes,
+            memory_access.l2_read_bytes,
+            memory_access.l2_write_bytes,
+            memory_access.sram_read_bytes,
+            memory_access.sram_write_bytes,
+            memory_access.register_read_bytes,
+            memory_access.register_write_bytes,
+        )
+    )
 
 
 def _matmul_engine(dtype: DType, hardware: HardwareSpec) -> EngineKind:

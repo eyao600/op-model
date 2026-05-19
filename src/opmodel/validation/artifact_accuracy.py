@@ -22,6 +22,10 @@ _HARDWARE_BY_PREFIX = {
     "yz8_": ("a100_40gb_pcie", "a100_40gb_pcie.yaml"),
     "a10_": ("a10", "a10.yaml"),
 }
+_GEMM_WORKLOAD_BATCHES = (16, 32, 64, 128)
+_GEMM_WORKLOAD_MNKS = (256, 512, 1024, 2048)
+_SOFTMAX_WORKLOAD_BATCHES = tuple(2**power for power in range(13, 20))
+_SOFTMAX_WORKLOAD_DIMS = (512, 1024)
 
 
 @dataclass(frozen=True)
@@ -160,10 +164,61 @@ def write_csv_report(report: ArtifactValidationReport, path: str | Path) -> None
             writer.writerow({field: getattr(row, field) for field in _CSV_FIELDS})
 
 
-def write_normalized_bar_plot(report: ArtifactValidationReport, path: str | Path) -> None:
+def read_csv_report(path: str | Path) -> ArtifactValidationReport:
+    rows: list[ArtifactAccuracyRow] = []
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            rows.append(
+                ArtifactAccuracyRow(
+                    source_file=str(row["source_file"]),
+                    row_index=int(row["row_index"]),
+                    hardware=str(row["hardware"]),
+                    op_kind=str(row["op_kind"]),
+                    dimensions=str(row["dimensions"]),
+                    measured_latency_ms=float(row["measured_latency_ms"]),
+                    predicted_latency_ms=float(row["predicted_latency_ms"]),
+                    latency_ratio=float(row["latency_ratio"]),
+                    latency_abs_pct_error=float(row["latency_abs_pct_error"]),
+                    measured_energy_j=float(row["measured_energy_j"]),
+                    predicted_energy_j=float(row["predicted_energy_j"]),
+                    energy_ratio=float(row["energy_ratio"]),
+                    energy_abs_pct_error=float(row["energy_abs_pct_error"]),
+                )
+            )
+    return ArtifactValidationReport(rows=tuple(rows), skip_counts={})
+
+
+def write_normalized_scatter_plot(report: ArtifactValidationReport, path: str | Path) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(_normalized_bar_plot_svg(report.aggregates()), encoding="utf-8")
+    output_path.write_text(_normalized_scatter_plot_svg(report.rows), encoding="utf-8")
+
+
+def write_gemm_workload_bar_plot(report: ArtifactValidationReport, path: str | Path) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(_gemm_workload_bar_plot_svg(report.rows), encoding="utf-8")
+
+
+def write_softmax_workload_bar_plot(report: ArtifactValidationReport, path: str | Path) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(_softmax_workload_bar_plot_svg(report.rows), encoding="utf-8")
+
+
+def write_validation_plots(report: ArtifactValidationReport, path: str | Path) -> tuple[Path, ...]:
+    scatter_path = Path(path)
+    gemm_path = _derived_plot_path(scatter_path, "gemm_workloads")
+    softmax_path = _derived_plot_path(scatter_path, "softmax_workloads")
+    write_normalized_scatter_plot(report, scatter_path)
+    write_gemm_workload_bar_plot(report, gemm_path)
+    write_softmax_workload_bar_plot(report, softmax_path)
+    return (scatter_path, gemm_path, softmax_path)
+
+
+def write_normalized_bar_plot(report: ArtifactValidationReport, path: str | Path) -> None:
+    write_normalized_scatter_plot(report, path)
 
 
 def format_text_report(report: ArtifactValidationReport) -> str:
@@ -408,8 +463,34 @@ def _mean(values: Iterable[float]) -> float:
     return sum(values_list) / len(values_list)
 
 
-def _normalized_bar_plot_svg(aggregates: tuple[AccuracyAggregate, ...]) -> str:
-    if not aggregates:
+@dataclass(frozen=True)
+class _ScatterPoint:
+    hardware: str
+    op_kind: str
+    working_set_bytes: int
+    latency_ratio: float
+    energy_ratio: float
+
+
+@dataclass(frozen=True)
+class _WorkloadPoint:
+    workload: str
+    hardware: str
+    latency_ratio: float
+    energy_ratio: float
+    count: int
+
+
+@dataclass(frozen=True)
+class _WorkloadSpec:
+    key: str
+    label: str
+    working_set_bytes: int
+
+
+def _normalized_scatter_plot_svg(rows: tuple[ArtifactAccuracyRow, ...]) -> str:
+    points = tuple(_scatter_point(row) for row in rows)
+    if not points:
         return (
             '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="220" '
             'viewBox="0 0 640 220">'
@@ -419,20 +500,31 @@ def _normalized_bar_plot_svg(aggregates: tuple[AccuracyAggregate, ...]) -> str:
             "</text></svg>\n"
         )
 
-    left = 72
-    right = 24
-    panel_height = 170
-    panel_gap = 74
-    top_time = 52
-    top_energy = top_time + panel_height + panel_gap
-    bottom = 90
-    group_width = 112
-    width = max(760, left + right + group_width * len(aggregates))
-    height = top_energy + panel_height + bottom
-    plot_width = width - left - right
+    op_order = tuple(
+        op_kind
+        for op_kind in (OpKind.BATCHED_GEMM.value, OpKind.LAYERNORM.value, OpKind.SOFTMAX.value)
+        if any(point.op_kind == op_kind for point in points)
+    )
+    op_order += tuple(
+        op_kind
+        for op_kind in sorted({point.op_kind for point in points})
+        if op_kind not in set(op_order)
+    )
+    hardware_order = tuple(sorted({point.hardware for point in points}))
+    colors = _hardware_colors(hardware_order)
 
-    def x_for_group(index: int) -> float:
-        return left + (index + 0.5) * plot_width / len(aggregates)
+    left = 84
+    right = 28
+    top = 76
+    panel_width = 310
+    panel_height = 210
+    column_gap = 46
+    row_gap = 82
+    legend_height = 34
+    bottom = 62
+    width = left + right + len(op_order) * panel_width + (len(op_order) - 1) * column_gap
+    height = top + legend_height + 2 * panel_height + row_gap + bottom
+    row_tops = (top + legend_height, top + legend_height + panel_height + row_gap)
 
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
@@ -440,72 +532,288 @@ def _normalized_bar_plot_svg(aggregates: tuple[AccuracyAggregate, ...]) -> str:
         '<rect width="100%" height="100%" fill="white"/>',
         (
             f'<text x="{left}" y="24" font-family="Arial, sans-serif" '
-            'font-size="18" font-weight="700">Normalized prediction accuracy</text>'
+            'font-size="18" font-weight="700">Normalized prediction scatter by working set</text>'
+        ),
+        (
+            f'<text x="{left}" y="46" font-family="Arial, sans-serif" '
+            'font-size="12" fill="#4b5563">x: bf16 working-set bytes, log scale; '
+            "y: predicted / measured ratio, log scale</text>"
         ),
     ]
 
-    _append_ratio_panel(
+    legend_x = left
+    for hardware in hardware_order:
+        parts.append(
+            f'<circle cx="{legend_x + 5}" cy="{top + 8}" r="5" fill="{colors[hardware]}"/>'
+        )
+        parts.append(
+            f'<text x="{legend_x + 16}" y="{top + 12}" font-family="Arial, sans-serif" '
+            f'font-size="12">{escape(hardware)}</text>'
+        )
+        legend_x += 132
+
+    metric_ranges = {
+        "latency": _log_range([point.latency_ratio for point in points] + [1.0, 10.0]),
+        "energy": _log_range([point.energy_ratio for point in points] + [1.0, 10.0]),
+    }
+    metrics = (
+        ("latency", "latency predicted / measured", lambda point: point.latency_ratio),
+        ("energy", "energy predicted / measured", lambda point: point.energy_ratio),
+    )
+
+    for row_index, (metric_key, metric_title, value_getter) in enumerate(metrics):
+        row_top = row_tops[row_index]
+        parts.append(
+            f'<text x="18" y="{row_top + panel_height / 2:.2f}" '
+            'font-family="Arial, sans-serif" font-size="13" font-weight="700" '
+            f'transform="rotate(-90 18 {row_top + panel_height / 2:.2f})">'
+            f"{escape(metric_title)}</text>"
+        )
+        for col_index, op_kind in enumerate(op_order):
+            panel_points = tuple(point for point in points if point.op_kind == op_kind)
+            x_range = _log_range([point.working_set_bytes for point in panel_points])
+            x = left + col_index * (panel_width + column_gap)
+            _append_scatter_panel(
+                parts=parts,
+                title=op_kind,
+                points=panel_points,
+                colors=colors,
+                metric_value=value_getter,
+                x=x,
+                y=row_top,
+                width=panel_width,
+                height=panel_height,
+                x_range=x_range,
+                y_range=metric_ranges[metric_key],
+                show_y_axis=col_index == 0,
+                show_x_axis=row_index == len(metrics) - 1,
+            )
+    parts.append("</svg>\n")
+    return "\n".join(parts)
+
+
+def _gemm_workload_bar_plot_svg(rows: tuple[ArtifactAccuracyRow, ...]) -> str:
+    workloads = tuple(
+        sorted(
+            (
+                _WorkloadSpec(
+                    key=f"B{batch}_MNK{mnk}",
+                    label=f"B{batch}/MNK{mnk}",
+                    working_set_bytes=_gemm_square_working_set_bytes(batch, mnk),
+                )
+                for batch in _GEMM_WORKLOAD_BATCHES
+                for mnk in _GEMM_WORKLOAD_MNKS
+            ),
+            key=lambda workload: (workload.working_set_bytes, workload.label),
+        )
+    )
+
+    def workload_for_row(row: ArtifactAccuracyRow) -> str | None:
+        if row.op_kind != OpKind.BATCHED_GEMM.value:
+            return None
+        dimensions = _parse_dimensions(row.dimensions)
+        batch = int(dimensions["batch"])
+        m = int(dimensions["M"])
+        n = int(dimensions["N"])
+        k = int(dimensions["K"])
+        if (
+            batch in _GEMM_WORKLOAD_BATCHES
+            and m == n
+            and n == k
+            and m in _GEMM_WORKLOAD_MNKS
+        ):
+            return f"B{batch}_MNK{m}"
+        return None
+
+    points = _workload_points(rows, workload_for_row)
+    return _normalized_workload_bar_plot_svg(
+        title="Square GEMM workload ratios",
+        subtitle="Filtered to B in [16, 32, 64, 128] and M=N=K in [256, 512, 1024, 2048]",
+        workloads=workloads,
+        points=points,
+    )
+
+
+def _softmax_workload_bar_plot_svg(rows: tuple[ArtifactAccuracyRow, ...]) -> str:
+    workloads = tuple(
+        sorted(
+            (
+                _WorkloadSpec(
+                    key=f"B{batch}_D{dim}",
+                    label=f"B2^{int(math.log2(batch))}/D{dim}",
+                    working_set_bytes=_softmax_working_set_bytes(batch, dim),
+                )
+                for batch in _SOFTMAX_WORKLOAD_BATCHES
+                for dim in _SOFTMAX_WORKLOAD_DIMS
+            ),
+            key=lambda workload: (workload.working_set_bytes, workload.label),
+        )
+    )
+
+    def workload_for_row(row: ArtifactAccuracyRow) -> str | None:
+        if row.op_kind != OpKind.SOFTMAX.value:
+            return None
+        dimensions = _parse_dimensions(row.dimensions)
+        batch = int(dimensions["batch"])
+        dim = int(dimensions["dim"])
+        if batch in _SOFTMAX_WORKLOAD_BATCHES and dim in _SOFTMAX_WORKLOAD_DIMS:
+            return f"B{batch}_D{dim}"
+        return None
+
+    points = _workload_points(rows, workload_for_row)
+    return _normalized_workload_bar_plot_svg(
+        title="Softmax workload ratios",
+        subtitle="Filtered to B=2^[13, 19] and Dim in [512, 1024]",
+        workloads=workloads,
+        points=points,
+    )
+
+
+def _normalized_workload_bar_plot_svg(
+    *,
+    title: str,
+    subtitle: str,
+    workloads: tuple[_WorkloadSpec, ...],
+    points: tuple[_WorkloadPoint, ...],
+) -> str:
+    if not points:
+        return (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="720" height="220" '
+            'viewBox="0 0 720 220">'
+            '<rect width="720" height="220" fill="white"/>'
+            f'<text x="28" y="42" font-family="Arial, sans-serif" font-size="18" '
+            f'font-weight="700">{escape(title)}</text>'
+            f'<text x="28" y="68" font-family="Arial, sans-serif" font-size="12" '
+            f'fill="#4b5563">{escape(subtitle)}</text>'
+            '<text x="28" y="112" font-family="Arial, sans-serif" font-size="14">'
+            "No matching workloads in report"
+            "</text></svg>\n"
+        )
+
+    hardware_order = tuple(sorted({point.hardware for point in points}))
+    colors = _hardware_colors(hardware_order)
+    points_by_key = {
+        (point.workload, point.hardware): point
+        for point in points
+    }
+    left = 72
+    right = 28
+    top = 92
+    panel_height = 185
+    panel_gap = 76
+    bottom = 118
+    group_width = max(68, 24 + len(hardware_order) * 17)
+    width = left + right + group_width * len(workloads)
+    top_latency = top
+    top_energy = top_latency + panel_height + panel_gap
+    height = top_energy + panel_height + bottom
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        (
+            f'<text x="{left}" y="26" font-family="Arial, sans-serif" '
+            f'font-size="18" font-weight="700">{escape(title)}</text>'
+        ),
+        (
+            f'<text x="{left}" y="48" font-family="Arial, sans-serif" '
+            f'font-size="12" fill="#4b5563">{escape(subtitle)}</text>'
+        ),
+    ]
+
+    legend_x = left
+    for hardware in hardware_order:
+        parts.append(
+            f'<rect x="{legend_x}" y="65" width="11" height="11" fill="{colors[hardware]}"/>'
+        )
+        parts.append(
+            f'<text x="{legend_x + 17}" y="75" font-family="Arial, sans-serif" '
+            f'font-size="12">{escape(hardware)}</text>'
+        )
+        legend_x += 132
+
+    y_max = _nice_axis_limit(
+        max(
+            1.0,
+            *(point.latency_ratio for point in points),
+            *(point.energy_ratio for point in points),
+        )
+        * 1.15
+    )
+
+    def x_for_group(index: int) -> float:
+        return left + (index + 0.5) * group_width
+
+    _append_workload_bar_panel(
         parts=parts,
-        title="time predicted / measured",
-        aggregates=aggregates,
-        values=[aggregate.latency_geomean_ratio for aggregate in aggregates],
-        color="#2563eb",
+        title="latency predicted / measured",
+        workloads=workloads,
+        hardware_order=hardware_order,
+        points_by_key=points_by_key,
+        colors=colors,
+        metric_value=lambda point: point.latency_ratio,
         left=left,
-        right=right,
+        top=top_latency,
         width=width,
-        top=top_time,
+        right=right,
         panel_height=panel_height,
+        y_max=y_max,
         x_for_group=x_for_group,
     )
-    _append_ratio_panel(
+    _append_workload_bar_panel(
         parts=parts,
         title="energy predicted / measured",
-        aggregates=aggregates,
-        values=[aggregate.energy_geomean_ratio for aggregate in aggregates],
-        color="#f97316",
+        workloads=workloads,
+        hardware_order=hardware_order,
+        points_by_key=points_by_key,
+        colors=colors,
+        metric_value=lambda point: point.energy_ratio,
         left=left,
-        right=right,
-        width=width,
         top=top_energy,
+        width=width,
+        right=right,
         panel_height=panel_height,
+        y_max=y_max,
         x_for_group=x_for_group,
     )
 
-    for index, aggregate in enumerate(aggregates):
+    label_y = top_energy + panel_height + 22
+    for index, workload in enumerate(workloads):
         center = x_for_group(index)
-        label = f"{aggregate.hardware}/{aggregate.op_kind}"
         parts.append(
-            f'<text x="{center:.2f}" y="{top_energy + panel_height + 20}" text-anchor="end" '
-            'font-family="Arial, sans-serif" font-size="11" '
-            f'transform="rotate(-35 {center:.2f} {top_energy + panel_height + 20})">'
-            f"{escape(label)}</text>"
+            f'<text x="{center:.2f}" y="{label_y}" text-anchor="end" '
+            'font-family="Arial, sans-serif" font-size="10" '
+            f'transform="rotate(-45 {center:.2f} {label_y})">'
+            f"{escape(workload.label)}</text>"
         )
     parts.append("</svg>\n")
     return "\n".join(parts)
 
 
-def _append_ratio_panel(
+def _append_workload_bar_panel(
     *,
     parts: list[str],
     title: str,
-    aggregates: tuple[AccuracyAggregate, ...],
-    values: list[float],
-    color: str,
+    workloads: tuple[_WorkloadSpec, ...],
+    hardware_order: tuple[str, ...],
+    points_by_key: Mapping[tuple[str, str], _WorkloadPoint],
+    colors: Mapping[str, str],
+    metric_value: Any,
     left: int,
-    right: int,
-    width: int,
     top: int,
+    width: int,
+    right: int,
     panel_height: int,
+    y_max: float,
     x_for_group: Any,
 ) -> None:
-    y_max = _nice_axis_limit(max(1.0, *values) * 1.15)
-
     def y_for_ratio(value: float) -> float:
         return top + panel_height - (value / y_max) * panel_height
 
     parts.append(
         f'<text x="{left}" y="{top - 14}" font-family="Arial, sans-serif" '
-        f'font-size="13" font-weight="700">{title}</text>'
+        f'font-size="13" font-weight="700">{escape(title)}</text>'
     )
     parts.append(
         f'<line x1="{left}" y1="{top + panel_height}" x2="{width - right}" '
@@ -513,9 +821,8 @@ def _append_ratio_panel(
     )
     parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + panel_height}" stroke="#333"/>')
 
-    tick_count = 4
-    for tick in range(tick_count + 1):
-        value = y_max * tick / tick_count
+    for tick in range(5):
+        value = y_max * tick / 4
         y = y_for_ratio(value)
         parts.append(
             f'<line x1="{left - 4}" y1="{y:.2f}" x2="{width - right}" '
@@ -523,7 +830,7 @@ def _append_ratio_panel(
         )
         parts.append(
             f'<text x="{left - 10}" y="{y + 4:.2f}" text-anchor="end" '
-            f'font-family="Arial, sans-serif" font-size="11">{value:.2g}</text>'
+            f'font-family="Arial, sans-serif" font-size="10">{value:.2g}</text>'
         )
 
     perfect_y = y_for_ratio(1.0)
@@ -533,23 +840,214 @@ def _append_ratio_panel(
     )
     parts.append(
         f'<text x="{width - right - 4}" y="{perfect_y - 6:.2f}" text-anchor="end" '
-        'font-family="Arial, sans-serif" font-size="11">1.0 perfect</text>'
+        'font-family="Arial, sans-serif" font-size="10">1.0 perfect</text>'
     )
 
-    bar_width = 32
-    for index, (aggregate, value) in enumerate(zip(aggregates, values, strict=True)):
+    bar_width = 12
+    bar_gap = 3
+    total_bar_width = len(hardware_order) * bar_width + (len(hardware_order) - 1) * bar_gap
+    for index, workload in enumerate(workloads):
         center = x_for_group(index)
-        x = center - bar_width / 2
-        y = y_for_ratio(value)
-        height_px = top + panel_height - y
+        start_x = center - total_bar_width / 2
+        for hardware_index, hardware in enumerate(hardware_order):
+            point = points_by_key.get((workload.key, hardware))
+            if point is None:
+                continue
+            value = metric_value(point)
+            y = y_for_ratio(value)
+            x = start_x + hardware_index * (bar_width + bar_gap)
+            parts.append(
+                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width}" '
+                f'height="{top + panel_height - y:.2f}" fill="{colors[hardware]}"/>'
+            )
+
+
+def _append_scatter_panel(
+    *,
+    parts: list[str],
+    title: str,
+    points: tuple[_ScatterPoint, ...],
+    colors: Mapping[str, str],
+    metric_value: Any,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    show_y_axis: bool,
+    show_x_axis: bool,
+) -> None:
+    x_min, x_max = x_range
+    y_min, y_max = y_range
+    parts.append(
+        f'<text x="{x}" y="{y - 16}" font-family="Arial, sans-serif" '
+        f'font-size="13" font-weight="700">{escape(title)}</text>'
+    )
+    parts.append(
+        f'<rect x="{x}" y="{y}" width="{width}" height="{height}" '
+        'fill="#ffffff" stroke="#d1d5db"/>'
+    )
+
+    for tick in _log_ticks(x_min, x_max):
+        tick_x = _log_x(tick, x_min, x_max, x, width)
         parts.append(
-            f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width}" '
-            f'height="{height_px:.2f}" fill="{color}"/>'
+            f'<line x1="{tick_x:.2f}" y1="{y}" x2="{tick_x:.2f}" '
+            f'y2="{y + height}" stroke="#f3f4f6"/>'
         )
+        if show_x_axis:
+            parts.append(
+                f'<text x="{tick_x:.2f}" y="{y + height + 18}" text-anchor="middle" '
+                f'font-family="Arial, sans-serif" font-size="10">{_format_bytes(tick)}</text>'
+            )
+
+    for tick in _log_ticks(y_min, y_max):
+        tick_y = _log_y(tick, y_min, y_max, y, height)
         parts.append(
-            f'<text x="{center:.2f}" y="{max(top + 12, y - 5):.2f}" text-anchor="middle" '
-            f'font-family="Arial, sans-serif" font-size="10">{value:.2g}</text>'
+            f'<line x1="{x}" y1="{tick_y:.2f}" x2="{x + width}" '
+            f'y2="{tick_y:.2f}" stroke="#e5e7eb"/>'
         )
+        if show_y_axis:
+            parts.append(
+                f'<text x="{x - 8}" y="{tick_y + 4:.2f}" text-anchor="end" '
+                f'font-family="Arial, sans-serif" font-size="10">{_format_ratio(tick)}</text>'
+            )
+
+    perfect_y = _log_y(1.0, y_min, y_max, y, height)
+    parts.append(
+        f'<line x1="{x}" y1="{perfect_y:.2f}" x2="{x + width}" '
+        f'y2="{perfect_y:.2f}" stroke="#111827" stroke-dasharray="5 4"/>'
+    )
+    if show_y_axis:
+        parts.append(
+            f'<text x="{x + 5}" y="{perfect_y - 6:.2f}" '
+            'font-family="Arial, sans-serif" font-size="10">1.0 perfect</text>'
+        )
+
+    for point in points:
+        value = metric_value(point)
+        if point.working_set_bytes <= 0 or value <= 0 or not math.isfinite(value):
+            continue
+        point_x = _log_x(point.working_set_bytes, x_min, x_max, x, width)
+        point_y = _log_y(value, y_min, y_max, y, height)
+        parts.append(
+            f'<circle cx="{point_x:.2f}" cy="{point_y:.2f}" r="2.2" '
+            f'fill="{colors[point.hardware]}" fill-opacity="0.48"/>'
+        )
+
+
+def _scatter_point(row: ArtifactAccuracyRow) -> _ScatterPoint:
+    return _ScatterPoint(
+        hardware=row.hardware,
+        op_kind=row.op_kind,
+        working_set_bytes=_working_set_bytes(row),
+        latency_ratio=row.latency_ratio,
+        energy_ratio=row.energy_ratio,
+    )
+
+
+def _workload_points(
+    rows: tuple[ArtifactAccuracyRow, ...], workload_for_row: Any
+) -> tuple[_WorkloadPoint, ...]:
+    groups: dict[tuple[str, str], list[ArtifactAccuracyRow]] = defaultdict(list)
+    for row in rows:
+        workload = workload_for_row(row)
+        if workload is not None:
+            groups[(workload, row.hardware)].append(row)
+
+    points: list[_WorkloadPoint] = []
+    for (workload, hardware), grouped_rows in sorted(groups.items()):
+        points.append(
+            _WorkloadPoint(
+                workload=workload,
+                hardware=hardware,
+                latency_ratio=_geomean(row.latency_ratio for row in grouped_rows),
+                energy_ratio=_geomean(row.energy_ratio for row in grouped_rows),
+                count=len(grouped_rows),
+            )
+        )
+    return tuple(points)
+
+
+def _working_set_bytes(row: ArtifactAccuracyRow) -> int:
+    dimensions = _parse_dimensions(row.dimensions)
+    dtype_bytes = 2
+    if row.op_kind == OpKind.BATCHED_GEMM.value:
+        batch = int(dimensions["batch"])
+        m = int(dimensions["M"])
+        n = int(dimensions["N"])
+        k = int(dimensions["K"])
+        return dtype_bytes * batch * (m * k + k * n + m * n)
+    if row.op_kind == OpKind.LAYERNORM.value:
+        batch = int(dimensions["batch"])
+        dim = int(dimensions["dim"])
+        return dtype_bytes * (batch * dim + 2 * dim + batch * dim)
+    if row.op_kind == OpKind.SOFTMAX.value:
+        batch = int(dimensions["batch"])
+        dim = int(dimensions["dim"])
+        return _softmax_working_set_bytes(batch, dim)
+    raise ValueError(f"unsupported op kind for working-set bytes: {row.op_kind}")
+
+
+def _gemm_square_working_set_bytes(batch: int, mnk: int) -> int:
+    dtype_bytes = 2
+    return dtype_bytes * batch * (mnk * mnk + mnk * mnk + mnk * mnk)
+
+
+def _softmax_working_set_bytes(batch: int, dim: int) -> int:
+    dtype_bytes = 2
+    return dtype_bytes * (batch * dim + batch * dim)
+
+
+def _parse_dimensions(value: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for part in value.split(","):
+        key, raw_value = part.split("=", 1)
+        result[key] = raw_value
+    return result
+
+
+def _hardware_colors(hardware_order: tuple[str, ...]) -> dict[str, str]:
+    palette = ("#2563eb", "#f97316", "#16a34a", "#9333ea", "#dc2626", "#0891b2")
+    return {hardware: palette[index % len(palette)] for index, hardware in enumerate(hardware_order)}
+
+
+def _log_range(values: Iterable[float]) -> tuple[float, float]:
+    positive = [value for value in values if value > 0.0 and math.isfinite(value)]
+    if not positive:
+        return (0.0, 1.0)
+    lower = math.floor(math.log10(min(positive)))
+    upper = math.ceil(math.log10(max(positive)))
+    if lower == upper:
+        lower -= 1
+        upper += 1
+    return (float(lower), float(upper))
+
+
+def _log_ticks(lower: float, upper: float) -> tuple[float, ...]:
+    return tuple(10.0**power for power in range(int(lower), int(upper) + 1))
+
+
+def _log_x(value: float, lower: float, upper: float, x: int, width: int) -> float:
+    return x + ((math.log10(value) - lower) / (upper - lower)) * width
+
+
+def _log_y(value: float, lower: float, upper: float, y: int, height: int) -> float:
+    return y + height - ((math.log10(value) - lower) / (upper - lower)) * height
+
+
+def _format_bytes(value: float) -> str:
+    units = (("T", 1.0e12), ("G", 1.0e9), ("M", 1.0e6), ("K", 1.0e3))
+    for suffix, scale in units:
+        if value >= scale:
+            return f"{value / scale:g}{suffix}"
+    return f"{value:g}"
+
+
+def _format_ratio(value: float) -> str:
+    if 0.01 <= value < 100.0:
+        return f"{value:g}"
+    return f"{value:.0e}"
 
 
 def _nice_axis_limit(value: float) -> float:
@@ -560,6 +1058,11 @@ def _nice_axis_limit(value: float) -> float:
     if value <= 3.0:
         return 3.0
     return math.ceil(value)
+
+
+def _derived_plot_path(path: Path, suffix: str) -> Path:
+    extension = path.suffix or ".svg"
+    return path.with_name(f"{path.stem}_{suffix}{extension}")
 
 
 _CSV_FIELDS = (

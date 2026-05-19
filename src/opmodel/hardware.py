@@ -15,6 +15,7 @@ class MemoryLevel:
     size_bytes: int | None
     bandwidth_bytes_per_s: float
     energy_j_per_byte: float
+    latency_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,9 @@ class ComputeUnit:
     tensor_flops_per_s: Mapping[DType, float]
     vector_energy_j_per_flop: Mapping[DType, float]
     tensor_energy_j_per_flop: Mapping[DType, float]
+    num_sms: int | None = None
+    fma_dims: tuple[int, int, int] | None = None
+    dataflow: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,7 @@ class HardwareSpec:
     compute: ComputeUnit
     memory_levels: Mapping[str, MemoryLevel]
     utilization: Utilization = field(default_factory=Utilization)
+    kernel_launch_overhead_s: float = 0.0
 
 
 def load_hardware(path: str | Path) -> HardwareSpec:
@@ -76,6 +81,9 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
             compute_data.get("tensor_energy_j_per_flop", {}),
             "compute.tensor_energy_j_per_flop",
         ),
+        num_sms=_optional_int(compute_data.get("num_sms")),
+        fma_dims=_optional_fma_dims(compute_data.get("fma_dims")),
+        dataflow=_optional_str(compute_data.get("dataflow")),
     )
 
     memory_data = _expect_mapping(data.get("memory", {}), "memory")
@@ -90,6 +98,7 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
             size_bytes=_optional_int(level_data.get("size_bytes")),
             bandwidth_bytes_per_s=float(level_data.get("bandwidth_bytes_per_s", 0.0)),
             energy_j_per_byte=float(level_data.get("energy_j_per_byte", 0.0)),
+            latency_s=float(level_data.get("latency_s", 0.0)),
         )
         if not level.name:
             raise ValueError(f"memory.levels[{index}].name is required")
@@ -115,6 +124,7 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
         compute=compute,
         memory_levels=memory_levels,
         utilization=utilization,
+        kernel_launch_overhead_s=float(data.get("kernel_launch_overhead_s", 0.0)),
     )
 
 
@@ -140,11 +150,22 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
             if value < 0:
                 raise ValueError(f"{engine_name} energy for {dtype.value} must be non-negative")
 
+    if hardware.compute.num_sms is not None and hardware.compute.num_sms <= 0:
+        raise ValueError("compute.num_sms must be positive")
+    if hardware.compute.fma_dims is not None:
+        for dim in hardware.compute.fma_dims:
+            if dim <= 0:
+                raise ValueError("compute.fma_dims values must be positive")
+    if hardware.kernel_launch_overhead_s < 0:
+        raise ValueError("kernel_launch_overhead_s must be non-negative")
+
     for level in hardware.memory_levels.values():
         if level.bandwidth_bytes_per_s <= 0:
             raise ValueError(f"Memory bandwidth for {level.name} must be positive")
         if level.energy_j_per_byte < 0:
             raise ValueError(f"Memory energy for {level.name} must be non-negative")
+        if level.latency_s < 0:
+            raise ValueError(f"Memory latency for {level.name} must be non-negative")
 
     _validate_utilization("vector", hardware.utilization.vector)
     _validate_utilization("tensor", hardware.utilization.tensor)
@@ -189,3 +210,22 @@ def _optional_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _optional_fma_dims(value: Any) -> tuple[int, int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        try:
+            return (int(value["m"]), int(value["n"]), int(value["k"]))
+        except KeyError as exc:
+            raise ValueError(f"compute.fma_dims missing {exc.args[0]}") from exc
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return (int(value[0]), int(value[1]), int(value[2]))
+    raise ValueError("compute.fma_dims must be a three-item sequence or m/n/k mapping")

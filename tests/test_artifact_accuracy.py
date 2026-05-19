@@ -11,7 +11,7 @@ from opmodel.validation.artifact_accuracy import (
     format_text_report,
     run_artifact_validation,
     write_csv_report,
-    write_normalized_bar_plot,
+    write_validation_plots,
 )
 
 
@@ -109,29 +109,67 @@ def test_artifact_report_writes_csv_and_svg(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     _write_csv(
+        data_dir / "a10_gemm_bf16bf16_freq900_lut.csv",
+        ["batch", "dimM", "dimN", "dimK", "trans", "precM", "precA", "time", "energy"],
+        [
+            {
+                "batch": "16",
+                "dimM": "256",
+                "dimN": "256",
+                "dimK": "256",
+                "trans": "nn",
+                "precM": "bf16",
+                "precA": "bf16",
+                "time": "2.0",
+                "energy": "0.2",
+            }
+        ],
+    )
+    _write_csv(
         data_dir / "a10_softmax_bf16_freq900_lut.csv",
         ["batch", "dim", "time", "energy", "prec"],
-        [{"batch": "2", "dim": "8", "time": "1.0", "energy": "0.025", "prec": "bf16"}],
+        [
+            {"batch": "2", "dim": "8", "time": "1.0", "energy": "0.025", "prec": "bf16"},
+            {
+                "batch": "8192",
+                "dim": "512",
+                "time": "1.0",
+                "energy": "0.025",
+                "prec": "bf16",
+            },
+        ],
     )
     report = run_artifact_validation(data_dir=data_dir, hardware_dir=HARDWARE_DIR)
 
     csv_path = tmp_path / "reports" / "accuracy.csv"
     svg_path = tmp_path / "reports" / "accuracy.svg"
     write_csv_report(report, csv_path)
-    write_normalized_bar_plot(report, svg_path)
+    plot_paths = write_validation_plots(report, svg_path)
 
     with csv_path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert rows[0]["hardware"] == "a10"
-    assert rows[0]["op_kind"] == "softmax"
-    assert float(rows[0]["measured_energy_j"]) == pytest.approx(0.025)
+    assert {row["op_kind"] for row in rows} == {"batched_gemm", "softmax"}
 
     svg = svg_path.read_text(encoding="utf-8")
-    assert "Normalized prediction accuracy" in svg
-    assert "a10/softmax" in svg
+    assert "Normalized prediction scatter by working set" in svg
+    assert "working-set bytes" in svg
+    assert "a10" in svg
+    assert "softmax" in svg
     assert "1.0 perfect" in svg
-    assert "time predicted / measured" in svg
+    assert "latency predicted / measured" in svg
     assert "energy predicted / measured" in svg
+    assert len(plot_paths) == 3
+    gemm_svg = (tmp_path / "reports" / "accuracy_gemm_workloads.svg").read_text(
+        encoding="utf-8"
+    )
+    softmax_svg = (tmp_path / "reports" / "accuracy_softmax_workloads.svg").read_text(
+        encoding="utf-8"
+    )
+    assert "Square GEMM workload ratios" in gemm_svg
+    assert "B16/MNK256" in gemm_svg
+    assert "Softmax workload ratios" in softmax_svg
+    assert "B2^13/D512" in softmax_svg
 
 
 def test_real_artifact_data_smoke() -> None:
@@ -141,6 +179,23 @@ def test_real_artifact_data_smoke() -> None:
     report = run_artifact_validation(
         data_dir=DEFAULT_ARTIFACT_DATA_DIR,
         hardware_dir=HARDWARE_DIR,
+        limit=1,
+    )
+
+    assert report.rows
+    assert {"a10", "a100_40gb_pcie"}.issubset({row.hardware for row in report.rows})
+    assert all(math.isfinite(row.latency_ratio) for row in report.rows)
+    assert all(math.isfinite(row.energy_ratio) for row in report.rows)
+
+
+def test_real_artifact_data_base_model_smoke() -> None:
+    if not DEFAULT_ARTIFACT_DATA_DIR.is_dir():
+        pytest.skip(f"artifact data directory not present: {DEFAULT_ARTIFACT_DATA_DIR}")
+
+    report = run_artifact_validation(
+        data_dir=DEFAULT_ARTIFACT_DATA_DIR,
+        hardware_dir=HARDWARE_DIR,
+        model_name="base",
         limit=1,
     )
 

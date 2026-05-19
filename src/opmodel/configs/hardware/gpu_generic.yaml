@@ -3,6 +3,9 @@ kind: gpu
 
 compute:
   clock_hz: 1.4e9
+  num_sms: 80
+  fma_dims: [16, 8, 16]
+  dataflow: output_stationary
   vector_flops_per_s:
     fp32: 2.0e13
     fp16: 2.0e13

@@ -97,6 +97,8 @@ class MemoryAccess:
     l2_write_bytes: int | None = None
     sram_read_bytes: int | None = None
     sram_write_bytes: int | None = None
+    register_read_bytes: int | None = None
+    register_write_bytes: int | None = None
 
 
 @dataclass(frozen=True)

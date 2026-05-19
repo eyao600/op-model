@@ -3,6 +3,9 @@ kind: tpu
 
 compute:
   clock_hz: 1.0e9
+  num_sms: 128
+  fma_dims: [16, 16, 16]
+  dataflow: output_stationary
   vector_flops_per_s:
     fp32: 1.0e13
     bf16: 1.0e13

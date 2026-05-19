@@ -7,6 +7,9 @@ kind: gpu
 # derived from power_cap divided by the corresponding peak throughput.
 compute:
   clock_hz: 9.0e8
+  num_sms: 72
+  fma_dims: [16, 8, 16]
+  dataflow: output_stationary
   vector_flops_per_s:
     fp32: 1.6566371681415932e13
     bf16: 1.6566371681415932e13

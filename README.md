@@ -59,7 +59,7 @@ opmodel predict \
 The command writes JSON to stdout.
 
 To compare bf16 predictions against the EnergAIzer artifact data and write a
-normalized SVG accuracy plot:
+normalized SVG scatter plot:
 
 ```bash
 opmodel validate-artifact \
@@ -69,7 +69,11 @@ opmodel validate-artifact \
 
 The validation harness uses the A100 40GB PCIe and A10 hardware configs in
 `src/opmodel/configs/hardware/`, compares latency and total energy, and uses
-the artifact CSV `energy` value as measured per-op energy.
+the artifact CSV `energy` value as measured per-op energy. The SVG plots show
+predicted/measured latency and energy versus bf16 working-set bytes, with one
+panel per op type and hardware shown by color. The harness also writes
+workload-filtered normalized bar plots for square GEMM and softmax subsets next
+to the requested plot path.
 
 ## Hardware Config Schema
 

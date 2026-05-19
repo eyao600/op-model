@@ -76,4 +76,10 @@ def test_cli_validate_artifact_writes_report_and_plot(tmp_path: Path) -> None:
     assert "Processed supported rows: 1" in result.stdout
     assert output_csv.exists()
     assert output_plot.exists()
-    assert "Normalized prediction accuracy" in output_plot.read_text(encoding="utf-8")
+    assert (tmp_path / "accuracy_gemm_workloads.svg").exists()
+    assert (tmp_path / "accuracy_softmax_workloads.svg").exists()
+    assert "Normalized prediction scatter by working set" in output_plot.read_text(
+        encoding="utf-8"
+    )
+    assert "accuracy_gemm_workloads.svg" in result.stdout
+    assert "accuracy_softmax_workloads.svg" in result.stdout

@@ -17,7 +17,7 @@ from opmodel.validation.artifact_accuracy import (
     format_text_report,
     run_artifact_validation,
     write_csv_report,
-    write_normalized_bar_plot,
+    write_validation_plots,
 )
 
 
@@ -56,13 +56,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.output_csv:
             write_csv_report(report, args.output_csv)
+        plot_paths = ()
         if not args.no_plot and args.output_plot:
-            write_normalized_bar_plot(report, args.output_plot)
+            plot_paths = write_validation_plots(report, args.output_plot)
         print(format_text_report(report))
         if args.output_csv:
             print(f"Wrote CSV report: {args.output_csv}")
-        if not args.no_plot and args.output_plot:
-            print(f"Wrote normalized bar plot: {args.output_plot}")
+        for plot_path in plot_paths:
+            print(f"Wrote normalized plot: {plot_path}")
         return 0
     raise AssertionError(f"Unhandled command: {args.command}")
 
