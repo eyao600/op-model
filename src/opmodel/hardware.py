@@ -16,6 +16,10 @@ class MemoryLevel:
     bandwidth_bytes_per_s: float
     energy_j_per_byte: float
     latency_s: float = 0.0
+    line_size_bytes: int | None = None
+    sector_size_bytes: int | None = None
+    bank_count: int | None = None
+    bank_width_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,12 @@ class ComputeUnit:
     num_sms: int | None = None
     fma_dims: tuple[int, int, int] | None = None
     dataflow: str | None = None
+    max_ctas_per_sm: int | None = None
+    max_warps_per_sm: int | None = None
+    registers_per_sm: int | None = None
+    shared_memory_bytes_per_sm: int | None = None
+    max_async_copy_groups: int | None = None
+    tensor_latency_cycles: int | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +94,14 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
         num_sms=_optional_int(compute_data.get("num_sms")),
         fma_dims=_optional_fma_dims(compute_data.get("fma_dims")),
         dataflow=_optional_str(compute_data.get("dataflow")),
+        max_ctas_per_sm=_optional_int(compute_data.get("max_ctas_per_sm")),
+        max_warps_per_sm=_optional_int(compute_data.get("max_warps_per_sm")),
+        registers_per_sm=_optional_int(compute_data.get("registers_per_sm")),
+        shared_memory_bytes_per_sm=_optional_int(
+            compute_data.get("shared_memory_bytes_per_sm")
+        ),
+        max_async_copy_groups=_optional_int(compute_data.get("max_async_copy_groups")),
+        tensor_latency_cycles=_optional_int(compute_data.get("tensor_latency_cycles")),
     )
 
     memory_data = _expect_mapping(data.get("memory", {}), "memory")
@@ -99,6 +117,10 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
             bandwidth_bytes_per_s=float(level_data.get("bandwidth_bytes_per_s", 0.0)),
             energy_j_per_byte=float(level_data.get("energy_j_per_byte", 0.0)),
             latency_s=float(level_data.get("latency_s", 0.0)),
+            line_size_bytes=_optional_int(level_data.get("line_size_bytes")),
+            sector_size_bytes=_optional_int(level_data.get("sector_size_bytes")),
+            bank_count=_optional_int(level_data.get("bank_count")),
+            bank_width_bytes=_optional_int(level_data.get("bank_width_bytes")),
         )
         if not level.name:
             raise ValueError(f"memory.levels[{index}].name is required")
@@ -156,6 +178,17 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
         for dim in hardware.compute.fma_dims:
             if dim <= 0:
                 raise ValueError("compute.fma_dims values must be positive")
+    for field_name in (
+        "max_ctas_per_sm",
+        "max_warps_per_sm",
+        "registers_per_sm",
+        "shared_memory_bytes_per_sm",
+        "max_async_copy_groups",
+        "tensor_latency_cycles",
+    ):
+        value = getattr(hardware.compute, field_name)
+        if value is not None and value <= 0:
+            raise ValueError(f"compute.{field_name} must be positive")
     if hardware.kernel_launch_overhead_s < 0:
         raise ValueError("kernel_launch_overhead_s must be non-negative")
 
@@ -166,6 +199,15 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
             raise ValueError(f"Memory energy for {level.name} must be non-negative")
         if level.latency_s < 0:
             raise ValueError(f"Memory latency for {level.name} must be non-negative")
+        for field_name in (
+            "line_size_bytes",
+            "sector_size_bytes",
+            "bank_count",
+            "bank_width_bytes",
+        ):
+            value = getattr(level, field_name)
+            if value is not None and value <= 0:
+                raise ValueError(f"Memory {field_name} for {level.name} must be positive")
 
     _validate_utilization("vector", hardware.utilization.vector)
     _validate_utilization("tensor", hardware.utilization.tensor)

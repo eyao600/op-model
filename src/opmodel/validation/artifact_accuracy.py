@@ -58,6 +58,11 @@ class ArtifactAccuracyRow:
 
 
 @dataclass(frozen=True)
+class ArtifactPerformanceDetailsRow:
+    values: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class AccuracyAggregate:
     hardware: str
     op_kind: str
@@ -72,6 +77,7 @@ class AccuracyAggregate:
 class ArtifactValidationReport:
     rows: tuple[ArtifactAccuracyRow, ...]
     skip_counts: Mapping[str, int]
+    performance_details: tuple[ArtifactPerformanceDetailsRow, ...] = ()
 
     def aggregates(self) -> tuple[AccuracyAggregate, ...]:
         groups: dict[tuple[str, str], list[ArtifactAccuracyRow]] = defaultdict(list)
@@ -109,6 +115,7 @@ def run_artifact_validation(
     model = create_model(model_name)
     hardware_cache: dict[str, HardwareSpec] = {}
     rows: list[ArtifactAccuracyRow] = []
+    performance_details: list[ArtifactPerformanceDetailsRow] = []
     skip_counts: Counter[str] = Counter()
 
     for csv_path in sorted(data_path.glob("*.csv")):
@@ -145,13 +152,19 @@ def run_artifact_validation(
                     continue
                 try:
                     sample = _sample_from_row(csv_path, row_index, hardware_name, op_kind, row)
-                    rows.append(_predict_sample(sample, hardware, model))
+                    accuracy_row, detail_row = _predict_sample(sample, hardware, model)
+                    rows.append(accuracy_row)
+                    performance_details.append(detail_row)
                     file_rows += 1
                 except (KeyError, ValueError) as exc:
                     reason = str(exc).splitlines()[0]
                     skip_counts[f"invalid_row:{reason}"] += 1
 
-    return ArtifactValidationReport(rows=tuple(rows), skip_counts=dict(skip_counts))
+    return ArtifactValidationReport(
+        rows=tuple(rows),
+        skip_counts=dict(skip_counts),
+        performance_details=tuple(performance_details),
+    )
 
 
 def write_csv_report(report: ArtifactValidationReport, path: str | Path) -> None:
@@ -162,6 +175,23 @@ def write_csv_report(report: ArtifactValidationReport, path: str | Path) -> None
         writer.writeheader()
         for row in report.rows:
             writer.writerow({field: getattr(row, field) for field in _CSV_FIELDS})
+
+
+def write_performance_details_csv_report(
+    report: ArtifactValidationReport, path: str | Path
+) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_PERFORMANCE_DETAIL_CSV_FIELDS)
+        writer.writeheader()
+        for row in report.performance_details:
+            writer.writerow(
+                {
+                    field: _csv_value(row.values.get(field))
+                    for field in _PERFORMANCE_DETAIL_CSV_FIELDS
+                }
+            )
 
 
 def read_csv_report(path: str | Path) -> ArtifactValidationReport:
@@ -195,25 +225,44 @@ def write_normalized_scatter_plot(report: ArtifactValidationReport, path: str | 
     output_path.write_text(_normalized_scatter_plot_svg(report.rows), encoding="utf-8")
 
 
-def write_gemm_workload_bar_plot(report: ArtifactValidationReport, path: str | Path) -> None:
+def write_gemm_workload_bar_plot(
+    report: ArtifactValidationReport,
+    path: str | Path,
+    *,
+    y_max: float | None = None,
+) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(_gemm_workload_bar_plot_svg(report.rows), encoding="utf-8")
+    output_path.write_text(
+        _gemm_workload_bar_plot_svg(report.rows, y_max=y_max), encoding="utf-8"
+    )
 
 
-def write_softmax_workload_bar_plot(report: ArtifactValidationReport, path: str | Path) -> None:
+def write_softmax_workload_bar_plot(
+    report: ArtifactValidationReport,
+    path: str | Path,
+    *,
+    y_max: float | None = None,
+) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(_softmax_workload_bar_plot_svg(report.rows), encoding="utf-8")
+    output_path.write_text(
+        _softmax_workload_bar_plot_svg(report.rows, y_max=y_max), encoding="utf-8"
+    )
 
 
-def write_validation_plots(report: ArtifactValidationReport, path: str | Path) -> tuple[Path, ...]:
+def write_validation_plots(
+    report: ArtifactValidationReport,
+    path: str | Path,
+    *,
+    workload_y_max: float | None = None,
+) -> tuple[Path, ...]:
     scatter_path = Path(path)
     gemm_path = _derived_plot_path(scatter_path, "gemm_workloads")
     softmax_path = _derived_plot_path(scatter_path, "softmax_workloads")
     write_normalized_scatter_plot(report, scatter_path)
-    write_gemm_workload_bar_plot(report, gemm_path)
-    write_softmax_workload_bar_plot(report, softmax_path)
+    write_gemm_workload_bar_plot(report, gemm_path, y_max=workload_y_max)
+    write_softmax_workload_bar_plot(report, softmax_path, y_max=workload_y_max)
     return (scatter_path, gemm_path, softmax_path)
 
 
@@ -358,13 +407,13 @@ def _softmax_sample(
 
 def _predict_sample(
     sample: ArtifactSample, hardware: HardwareSpec, model: Any
-) -> ArtifactAccuracyRow:
+) -> tuple[ArtifactAccuracyRow, ArtifactPerformanceDetailsRow]:
     profile = model.predict(sample.op, hardware)
     predicted_latency_ms = profile.latency_s * 1000.0
     predicted_energy_j = profile.energy_j
     latency_ratio = predicted_latency_ms / sample.measured_latency_ms
     energy_ratio = predicted_energy_j / sample.measured_energy_j
-    return ArtifactAccuracyRow(
+    accuracy_row = ArtifactAccuracyRow(
         source_file=sample.source_file,
         row_index=sample.row_index,
         hardware=sample.hardware,
@@ -379,6 +428,386 @@ def _predict_sample(
         energy_ratio=energy_ratio,
         energy_abs_pct_error=abs(energy_ratio - 1.0) * 100.0,
     )
+    return accuracy_row, _performance_details_row(sample, hardware, profile, accuracy_row)
+
+
+def _performance_details_row(
+    sample: ArtifactSample,
+    hardware: HardwareSpec,
+    profile: Any,
+    accuracy_row: ArtifactAccuracyRow,
+) -> ArtifactPerformanceDetailsRow:
+    diagnostics = profile.diagnostics
+    memory_access = profile.memory_access
+    dtype = _diagnostic_value(diagnostics, "problem", "input_dtype")
+    hardware_dtype = (
+        dtype
+        if isinstance(dtype, DType)
+        else DType(str(dtype))
+        if dtype is not None
+        else _first_tensor_dtype(sample.op)
+    )
+    peak_compute = _peak_compute_throughput(profile.engine.value, hardware_dtype, hardware)
+    compute_config_util = _compute_config_utilization(profile.engine.value, hardware)
+    predicted_latency_s = profile.latency_s
+    hbm_total = _total_bytes(memory_access.hbm_read_bytes, memory_access.hbm_write_bytes)
+    l2_total = _total_bytes(memory_access.l2_read_bytes, memory_access.l2_write_bytes)
+    sram_total = _total_bytes(memory_access.sram_read_bytes, memory_access.sram_write_bytes)
+    register_total = _total_bytes(
+        memory_access.register_read_bytes,
+        memory_access.register_write_bytes,
+    )
+    smem_read = _diagnostic_value(diagnostics, "transaction_bytes", "smem_read")
+    smem_write = _diagnostic_value(diagnostics, "transaction_bytes", "smem_write")
+    smem_total = _total_bytes(smem_read, smem_write)
+
+    values: dict[str, Any] = {
+        "source_file": accuracy_row.source_file,
+        "row_index": accuracy_row.row_index,
+        "hardware": accuracy_row.hardware,
+        "op_kind": accuracy_row.op_kind,
+        "dimensions": accuracy_row.dimensions,
+        "implementation": profile.implementation,
+        "engine": profile.engine.value,
+        "input_dtype": hardware_dtype.value,
+        "output_dtype": _diagnostic_value(diagnostics, "problem", "output_dtype"),
+        "problem_batch": _diagnostic_value(diagnostics, "problem", "batch"),
+        "problem_m": _diagnostic_value(diagnostics, "problem", "m"),
+        "problem_n": _diagnostic_value(diagnostics, "problem", "n"),
+        "problem_k": _diagnostic_value(diagnostics, "problem", "k"),
+        "beta_zero": _diagnostic_value(diagnostics, "problem", "beta_zero"),
+        "epilogue_reads_c": _diagnostic_value(
+            diagnostics, "problem", "epilogue_reads_c"
+        ),
+        "transpose_a": _diagnostic_value(diagnostics, "problem", "transpose_a"),
+        "transpose_b": _diagnostic_value(diagnostics, "problem", "transpose_b"),
+        "measured_latency_ms": accuracy_row.measured_latency_ms,
+        "predicted_latency_ms": accuracy_row.predicted_latency_ms,
+        "latency_ratio": accuracy_row.latency_ratio,
+        "measured_energy_j": accuracy_row.measured_energy_j,
+        "predicted_energy_j": accuracy_row.predicted_energy_j,
+        "energy_ratio": accuracy_row.energy_ratio,
+        "flops": profile.flops,
+        "predicted_elapsed_cycles": diagnostics.get("predicted_elapsed_cycles"),
+        "clock_hz": diagnostics.get("clock_hz"),
+        "predicted_flop_per_cycle": diagnostics.get("predicted_flop_per_cycle"),
+        "predicted_tflops_per_s": diagnostics.get("predicted_tflops_per_s"),
+        "achieved_flops_per_s": (profile.flops / predicted_latency_s)
+        if predicted_latency_s
+        else None,
+        "compute_latency_s": diagnostics.get("compute_latency_s"),
+        "memory_latency_s": diagnostics.get("memory_latency_s"),
+        "roofline_latency_s": diagnostics.get("roofline_latency_s"),
+        "kernel_launch_overhead_s": diagnostics.get("kernel_launch_overhead_s"),
+        "effective_flops_per_s": diagnostics.get("effective_flops_per_s"),
+        "effective_hbm_bandwidth_bytes_per_s": diagnostics.get(
+            "effective_hbm_bandwidth_bytes_per_s"
+        ),
+        "arithmetic_intensity_flops_per_byte": diagnostics.get(
+            "arithmetic_intensity_flops_per_byte"
+        ),
+        "peak_compute_throughput_flops_per_s": peak_compute,
+        "compute_config_utilization_factor": compute_config_util,
+        "effective_configured_compute_throughput_flops_per_s": (
+            peak_compute * compute_config_util if peak_compute is not None else None
+        ),
+        "compute_issue_utilization_factor": _diagnostic_value(
+            diagnostics, "utilization", "compute_issue"
+        ),
+        "compute_latency_utilization_factor": _diagnostic_value(
+            diagnostics, "utilization", "compute_latency_adjusted"
+        ),
+        "compute_active_utilization_factor": _diagnostic_value(
+            diagnostics, "utilization", "compute_active"
+        ),
+        "mma_ilp_efficiency": _diagnostic_value(
+            diagnostics, "utilization", "mma_ilp_efficiency"
+        ),
+        "cta_tile_m": _diagnostic_value(diagnostics, "kernel", "cta_tile", "m"),
+        "cta_tile_n": _diagnostic_value(diagnostics, "kernel", "cta_tile", "n"),
+        "cta_tile_k": _diagnostic_value(diagnostics, "kernel", "cta_tile", "k"),
+        "warp_tile_m": _diagnostic_value(diagnostics, "kernel", "warp_tile", "m"),
+        "warp_tile_n": _diagnostic_value(diagnostics, "kernel", "warp_tile", "n"),
+        "warp_tile_k": _diagnostic_value(diagnostics, "kernel", "warp_tile", "k"),
+        "mma_shape_m": _diagnostic_value(diagnostics, "kernel", "mma_shape", "m"),
+        "mma_shape_n": _diagnostic_value(diagnostics, "kernel", "mma_shape", "n"),
+        "mma_shape_k": _diagnostic_value(diagnostics, "kernel", "mma_shape", "k"),
+        "pipeline_stages": _diagnostic_value(diagnostics, "kernel", "pipeline_stages"),
+        "warps_per_cta": _diagnostic_value(diagnostics, "kernel", "warps_per_cta"),
+        "threads_per_cta": _diagnostic_value(diagnostics, "kernel", "threads_per_cta"),
+        "registers_per_thread": _diagnostic_value(
+            diagnostics, "kernel", "registers_per_thread"
+        ),
+        "shared_memory_bytes_per_cta": _diagnostic_value(
+            diagnostics, "kernel", "shared_memory_bytes_per_cta"
+        ),
+        "tile_strategy": _tile_strategy(diagnostics),
+        "cta_grid_m": _diagnostic_value(diagnostics, "cta_grid", "m"),
+        "cta_grid_n": _diagnostic_value(diagnostics, "cta_grid", "n"),
+        "cta_grid_k_stages": _diagnostic_value(diagnostics, "cta_grid", "k_stages"),
+        "cta_count": diagnostics.get("cta_count"),
+        "cta_waves": diagnostics.get("cta_waves"),
+        "resident_ctas_per_sm": diagnostics.get("resident_ctas_per_sm"),
+        "ctas_per_wave": diagnostics.get("ctas_per_wave"),
+        "tail_efficiency": diagnostics.get("tail_efficiency"),
+        "tile_efficiency": diagnostics.get("tile_efficiency"),
+        "occupancy_limiting_factors": diagnostics.get("occupancy_limiting_factors"),
+        "hbm_read_bytes": memory_access.hbm_read_bytes,
+        "hbm_write_bytes": memory_access.hbm_write_bytes,
+        "hbm_total_bytes": hbm_total,
+        "l2_read_bytes": memory_access.l2_read_bytes,
+        "l2_write_bytes": memory_access.l2_write_bytes,
+        "l2_total_bytes": l2_total,
+        "sram_read_bytes": memory_access.sram_read_bytes,
+        "sram_write_bytes": memory_access.sram_write_bytes,
+        "sram_total_bytes": sram_total,
+        "register_read_bytes": memory_access.register_read_bytes,
+        "register_write_bytes": memory_access.register_write_bytes,
+        "register_total_bytes": register_total,
+        "logical_a_bytes": _diagnostic_value(diagnostics, "logical_bytes", "a"),
+        "logical_b_bytes": _diagnostic_value(diagnostics, "logical_bytes", "b"),
+        "logical_c_read_bytes": _diagnostic_value(
+            diagnostics, "logical_bytes", "c_read"
+        ),
+        "logical_d_store_bytes": _diagnostic_value(
+            diagnostics, "logical_bytes", "d_store"
+        ),
+        "l2_requested_transaction_bytes": _diagnostic_value(
+            diagnostics, "transaction_bytes", "l2_requested"
+        ),
+        "dram_unique_transaction_bytes": _diagnostic_value(
+            diagnostics, "transaction_bytes", "dram_unique"
+        ),
+        "smem_read_transaction_bytes": smem_read,
+        "smem_write_transaction_bytes": smem_write,
+        "smem_total_transaction_bytes": smem_total,
+        "sector_size_bytes": _diagnostic_value(
+            diagnostics, "transaction_bytes", "sector_size"
+        ),
+        "line_size_bytes": _diagnostic_value(
+            diagnostics, "transaction_bytes", "line_size"
+        ),
+        "hbm_peak_bandwidth_bytes_per_s": _peak_memory_bandwidth("hbm", hardware),
+        "hbm_config_utilization_factor": _memory_config_utilization("hbm", hardware),
+        "hbm_effective_configured_bandwidth_bytes_per_s": _effective_memory_bandwidth(
+            "hbm", hardware
+        ),
+        "hbm_active_utilization_factor": _diagnostic_value(
+            diagnostics, "utilization", "dram"
+        ),
+        "hbm_average_bandwidth_bytes_per_s": _average_bandwidth(
+            hbm_total, predicted_latency_s
+        ),
+        "l2_peak_bandwidth_bytes_per_s": _peak_memory_bandwidth("l2", hardware),
+        "l2_config_utilization_factor": _memory_config_utilization("l2", hardware),
+        "l2_effective_configured_bandwidth_bytes_per_s": _effective_memory_bandwidth(
+            "l2", hardware
+        ),
+        "l2_active_utilization_factor": _diagnostic_value(
+            diagnostics, "utilization", "l2"
+        ),
+        "l2_average_bandwidth_bytes_per_s": _average_bandwidth(l2_total, predicted_latency_s),
+        "smem_peak_bandwidth_bytes_per_s": _smem_peak_bandwidth(hardware),
+        "smem_config_utilization_factor": _memory_config_utilization("sram", hardware),
+        "smem_effective_configured_bandwidth_bytes_per_s": _smem_effective_bandwidth(
+            hardware
+        ),
+        "smem_active_utilization_factor": _diagnostic_value(
+            diagnostics, "utilization", "smem"
+        ),
+        "smem_average_bandwidth_bytes_per_s": _average_bandwidth(
+            smem_total, predicted_latency_s
+        ),
+        "compute_active_cycles": _diagnostic_value(diagnostics, "active_cycles", "compute"),
+        "smem_active_cycles": _diagnostic_value(diagnostics, "active_cycles", "smem"),
+        "l2_active_cycles": _diagnostic_value(diagnostics, "active_cycles", "l2"),
+        "dram_active_cycles": _diagnostic_value(diagnostics, "active_cycles", "dram"),
+        "compute_stage_cycles": _diagnostic_value(diagnostics, "stage_cycles", "compute"),
+        "mma_issue_cycles": _diagnostic_value(diagnostics, "stage_cycles", "mma_issue"),
+        "mma_dependency_penalty_cycles": _diagnostic_value(
+            diagnostics, "stage_cycles", "mma_dependency_penalty"
+        ),
+        "smem_stage_cycles": _diagnostic_value(diagnostics, "stage_cycles", "smem"),
+        "global_load_issue_cycles": _diagnostic_value(
+            diagnostics, "stage_cycles", "global_load_issue"
+        ),
+        "l2_service_cycles": _diagnostic_value(diagnostics, "stage_cycles", "l2_service"),
+        "dram_service_cycles": _diagnostic_value(
+            diagnostics, "stage_cycles", "dram_service"
+        ),
+        "exposed_l2_cycles": _diagnostic_value(diagnostics, "stage_cycles", "exposed_l2"),
+        "exposed_dram_cycles": _diagnostic_value(
+            diagnostics, "stage_cycles", "exposed_dram"
+        ),
+        "stage_cycles": _diagnostic_value(diagnostics, "stage_cycles", "stage"),
+        "prologue_cycles": _diagnostic_value(diagnostics, "stage_cycles", "prologue"),
+        "epilogue_cycles": _diagnostic_value(diagnostics, "stage_cycles", "epilogue"),
+        "cta_cycles": _diagnostic_value(diagnostics, "stage_cycles", "cta"),
+        "compute_smem_overlap_factor": _diagnostic_value(
+            diagnostics, "overlap", "compute_smem"
+        ),
+        "compute_l2_overlap_factor": _diagnostic_value(
+            diagnostics, "overlap", "compute_l2"
+        ),
+        "compute_dram_overlap_factor": _diagnostic_value(
+            diagnostics, "overlap", "compute_dram"
+        ),
+        "smem_flop_per_byte": _diagnostic_value(
+            diagnostics, "operational_intensity", "smem_flop_per_byte"
+        ),
+        "l2_flop_per_byte": _diagnostic_value(
+            diagnostics, "operational_intensity", "l2_flop_per_byte"
+        ),
+        "dram_flop_per_byte": _diagnostic_value(
+            diagnostics, "operational_intensity", "dram_flop_per_byte"
+        ),
+        "merged_flop_per_byte": _diagnostic_value(
+            diagnostics, "operational_intensity", "merged_flop_per_byte"
+        ),
+        "roofline_bound_compute_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_bounds_flop_per_cycle", "compute"
+        ),
+        "roofline_bound_smem_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_bounds_flop_per_cycle", "smem"
+        ),
+        "roofline_bound_l2_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_bounds_flop_per_cycle", "l2"
+        ),
+        "roofline_bound_dram_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_bounds_flop_per_cycle", "dram"
+        ),
+        "hbm_memory_latency_s": _diagnostic_value(
+            diagnostics, "memory_level_latencies_s", "hbm"
+        ),
+        "l2_memory_latency_s": _diagnostic_value(
+            diagnostics, "memory_level_latencies_s", "l2"
+        ),
+        "sram_memory_latency_s": _diagnostic_value(
+            diagnostics, "memory_level_latencies_s", "sram"
+        ),
+        "register_memory_latency_s": _diagnostic_value(
+            diagnostics, "memory_level_latencies_s", "register"
+        ),
+        "primary_bottleneck": diagnostics.get("primary_bottleneck"),
+        "secondary_bottlenecks": diagnostics.get("secondary_bottlenecks"),
+        "warnings": diagnostics.get("warnings"),
+        "assumptions": diagnostics.get("assumptions"),
+    }
+    return ArtifactPerformanceDetailsRow(values=values)
+
+
+def _diagnostic_value(data: Mapping[str, Any], *path: str) -> Any:
+    value: Any = data
+    for key in path:
+        if not isinstance(value, Mapping) or key not in value:
+            return None
+        value = value[key]
+    return value
+
+
+def _tile_strategy(diagnostics: Mapping[str, Any]) -> str | None:
+    cta_m = _diagnostic_value(diagnostics, "kernel", "cta_tile", "m")
+    cta_n = _diagnostic_value(diagnostics, "kernel", "cta_tile", "n")
+    cta_k = _diagnostic_value(diagnostics, "kernel", "cta_tile", "k")
+    warp_m = _diagnostic_value(diagnostics, "kernel", "warp_tile", "m")
+    warp_n = _diagnostic_value(diagnostics, "kernel", "warp_tile", "n")
+    warp_k = _diagnostic_value(diagnostics, "kernel", "warp_tile", "k")
+    mma_m = _diagnostic_value(diagnostics, "kernel", "mma_shape", "m")
+    mma_n = _diagnostic_value(diagnostics, "kernel", "mma_shape", "n")
+    mma_k = _diagnostic_value(diagnostics, "kernel", "mma_shape", "k")
+    if cta_m is None or warp_m is None or mma_m is None:
+        return None
+    stages = _diagnostic_value(diagnostics, "kernel", "pipeline_stages")
+    warps = _diagnostic_value(diagnostics, "kernel", "warps_per_cta")
+    return (
+        f"cta={cta_m}x{cta_n}x{cta_k};"
+        f"warp={warp_m}x{warp_n}x{warp_k};"
+        f"mma={mma_m}x{mma_n}x{mma_k};"
+        f"stages={stages};warps={warps}"
+    )
+
+
+def _first_tensor_dtype(op: LocalOp) -> DType:
+    if not op.tensors:
+        return DType.BF16
+    return op.tensors[0].dtype
+
+
+def _peak_compute_throughput(
+    engine: str, dtype: DType, hardware: HardwareSpec
+) -> float | None:
+    if engine == "tensor":
+        return hardware.compute.tensor_flops_per_s.get(dtype)
+    if engine == "vector":
+        return hardware.compute.vector_flops_per_s.get(dtype)
+    return None
+
+
+def _compute_config_utilization(engine: str, hardware: HardwareSpec) -> float | None:
+    if engine == "tensor":
+        return hardware.utilization.tensor
+    if engine == "vector":
+        return hardware.utilization.vector
+    return None
+
+
+def _peak_memory_bandwidth(name: str, hardware: HardwareSpec) -> float | None:
+    level = hardware.memory_levels.get(name)
+    return None if level is None else level.bandwidth_bytes_per_s
+
+
+def _memory_config_utilization(name: str, hardware: HardwareSpec) -> float | None:
+    if name not in hardware.memory_levels:
+        return None
+    return hardware.utilization.memory.get(name, 1.0)
+
+
+def _effective_memory_bandwidth(name: str, hardware: HardwareSpec) -> float | None:
+    peak = _peak_memory_bandwidth(name, hardware)
+    utilization = _memory_config_utilization(name, hardware)
+    if peak is None or utilization is None:
+        return None
+    return peak * utilization
+
+
+def _smem_peak_bandwidth(hardware: HardwareSpec) -> float | None:
+    sram = _peak_memory_bandwidth("sram", hardware)
+    if sram is not None:
+        return sram
+    hbm = _peak_memory_bandwidth("hbm", hardware)
+    return None if hbm is None else hbm * 8.0
+
+
+def _smem_effective_bandwidth(hardware: HardwareSpec) -> float | None:
+    sram = _effective_memory_bandwidth("sram", hardware)
+    if sram is not None:
+        return sram
+    hbm = _effective_memory_bandwidth("hbm", hardware)
+    return None if hbm is None else hbm * 8.0
+
+
+def _total_bytes(read_bytes: Any, write_bytes: Any) -> int | None:
+    if read_bytes is None and write_bytes is None:
+        return None
+    return int(read_bytes or 0) + int(write_bytes or 0)
+
+
+def _average_bandwidth(total_bytes: Any, latency_s: float) -> float | None:
+    if total_bytes is None or latency_s <= 0.0:
+        return None
+    return float(total_bytes) / latency_s
+
+
+def _csv_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, (tuple, list)):
+        return "|".join(str(item) for item in value)
+    if isinstance(value, Mapping):
+        return "|".join(f"{key}={item}" for key, item in value.items())
+    return value
 
 
 def _hardware_info_for_file(filename: str) -> tuple[str, str] | None:
@@ -592,7 +1021,9 @@ def _normalized_scatter_plot_svg(rows: tuple[ArtifactAccuracyRow, ...]) -> str:
     return "\n".join(parts)
 
 
-def _gemm_workload_bar_plot_svg(rows: tuple[ArtifactAccuracyRow, ...]) -> str:
+def _gemm_workload_bar_plot_svg(
+    rows: tuple[ArtifactAccuracyRow, ...], *, y_max: float | None = None
+) -> str:
     workloads = tuple(
         sorted(
             (
@@ -631,10 +1062,13 @@ def _gemm_workload_bar_plot_svg(rows: tuple[ArtifactAccuracyRow, ...]) -> str:
         subtitle="Filtered to B in [16, 32, 64, 128] and M=N=K in [256, 512, 1024, 2048]",
         workloads=workloads,
         points=points,
+        y_max=y_max,
     )
 
 
-def _softmax_workload_bar_plot_svg(rows: tuple[ArtifactAccuracyRow, ...]) -> str:
+def _softmax_workload_bar_plot_svg(
+    rows: tuple[ArtifactAccuracyRow, ...], *, y_max: float | None = None
+) -> str:
     workloads = tuple(
         sorted(
             (
@@ -666,6 +1100,7 @@ def _softmax_workload_bar_plot_svg(rows: tuple[ArtifactAccuracyRow, ...]) -> str
         subtitle="Filtered to B=2^[13, 19] and Dim in [512, 1024]",
         workloads=workloads,
         points=points,
+        y_max=y_max,
     )
 
 
@@ -675,6 +1110,7 @@ def _normalized_workload_bar_plot_svg(
     subtitle: str,
     workloads: tuple[_WorkloadSpec, ...],
     points: tuple[_WorkloadPoint, ...],
+    y_max: float | None = None,
 ) -> str:
     if not points:
         return (
@@ -733,14 +1169,17 @@ def _normalized_workload_bar_plot_svg(
         )
         legend_x += 132
 
-    y_max = _nice_axis_limit(
-        max(
-            1.0,
-            *(point.latency_ratio for point in points),
-            *(point.energy_ratio for point in points),
+    if y_max is None:
+        y_max = _nice_axis_limit(
+            max(
+                1.0,
+                *(point.latency_ratio for point in points),
+                *(point.energy_ratio for point in points),
+            )
+            * 1.15
         )
-        * 1.15
-    )
+    elif y_max <= 0.0 or not math.isfinite(y_max):
+        raise ValueError("y_max must be positive and finite")
 
     def x_for_group(index: int) -> float:
         return left + (index + 0.5) * group_width
@@ -854,7 +1293,7 @@ def _append_workload_bar_panel(
             if point is None:
                 continue
             value = metric_value(point)
-            y = y_for_ratio(value)
+            y = y_for_ratio(min(value, y_max))
             x = start_x + hardware_index * (bar_width + bar_gap)
             parts.append(
                 f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width}" '
@@ -1079,4 +1518,150 @@ _CSV_FIELDS = (
     "predicted_energy_j",
     "energy_ratio",
     "energy_abs_pct_error",
+)
+
+
+_PERFORMANCE_DETAIL_CSV_FIELDS = (
+    "source_file",
+    "row_index",
+    "hardware",
+    "op_kind",
+    "dimensions",
+    "implementation",
+    "engine",
+    "input_dtype",
+    "output_dtype",
+    "problem_batch",
+    "problem_m",
+    "problem_n",
+    "problem_k",
+    "beta_zero",
+    "epilogue_reads_c",
+    "transpose_a",
+    "transpose_b",
+    "measured_latency_ms",
+    "predicted_latency_ms",
+    "latency_ratio",
+    "measured_energy_j",
+    "predicted_energy_j",
+    "energy_ratio",
+    "flops",
+    "predicted_elapsed_cycles",
+    "clock_hz",
+    "predicted_flop_per_cycle",
+    "predicted_tflops_per_s",
+    "achieved_flops_per_s",
+    "compute_latency_s",
+    "memory_latency_s",
+    "roofline_latency_s",
+    "kernel_launch_overhead_s",
+    "effective_flops_per_s",
+    "effective_hbm_bandwidth_bytes_per_s",
+    "arithmetic_intensity_flops_per_byte",
+    "peak_compute_throughput_flops_per_s",
+    "compute_config_utilization_factor",
+    "effective_configured_compute_throughput_flops_per_s",
+    "compute_issue_utilization_factor",
+    "compute_latency_utilization_factor",
+    "compute_active_utilization_factor",
+    "mma_ilp_efficiency",
+    "tile_strategy",
+    "cta_tile_m",
+    "cta_tile_n",
+    "cta_tile_k",
+    "warp_tile_m",
+    "warp_tile_n",
+    "warp_tile_k",
+    "mma_shape_m",
+    "mma_shape_n",
+    "mma_shape_k",
+    "pipeline_stages",
+    "warps_per_cta",
+    "threads_per_cta",
+    "registers_per_thread",
+    "shared_memory_bytes_per_cta",
+    "cta_grid_m",
+    "cta_grid_n",
+    "cta_grid_k_stages",
+    "cta_count",
+    "cta_waves",
+    "resident_ctas_per_sm",
+    "ctas_per_wave",
+    "tail_efficiency",
+    "tile_efficiency",
+    "occupancy_limiting_factors",
+    "hbm_read_bytes",
+    "hbm_write_bytes",
+    "hbm_total_bytes",
+    "l2_read_bytes",
+    "l2_write_bytes",
+    "l2_total_bytes",
+    "sram_read_bytes",
+    "sram_write_bytes",
+    "sram_total_bytes",
+    "register_read_bytes",
+    "register_write_bytes",
+    "register_total_bytes",
+    "logical_a_bytes",
+    "logical_b_bytes",
+    "logical_c_read_bytes",
+    "logical_d_store_bytes",
+    "l2_requested_transaction_bytes",
+    "dram_unique_transaction_bytes",
+    "smem_read_transaction_bytes",
+    "smem_write_transaction_bytes",
+    "smem_total_transaction_bytes",
+    "sector_size_bytes",
+    "line_size_bytes",
+    "hbm_peak_bandwidth_bytes_per_s",
+    "hbm_config_utilization_factor",
+    "hbm_effective_configured_bandwidth_bytes_per_s",
+    "hbm_active_utilization_factor",
+    "hbm_average_bandwidth_bytes_per_s",
+    "l2_peak_bandwidth_bytes_per_s",
+    "l2_config_utilization_factor",
+    "l2_effective_configured_bandwidth_bytes_per_s",
+    "l2_active_utilization_factor",
+    "l2_average_bandwidth_bytes_per_s",
+    "smem_peak_bandwidth_bytes_per_s",
+    "smem_config_utilization_factor",
+    "smem_effective_configured_bandwidth_bytes_per_s",
+    "smem_active_utilization_factor",
+    "smem_average_bandwidth_bytes_per_s",
+    "compute_active_cycles",
+    "smem_active_cycles",
+    "l2_active_cycles",
+    "dram_active_cycles",
+    "compute_stage_cycles",
+    "mma_issue_cycles",
+    "mma_dependency_penalty_cycles",
+    "smem_stage_cycles",
+    "global_load_issue_cycles",
+    "l2_service_cycles",
+    "dram_service_cycles",
+    "exposed_l2_cycles",
+    "exposed_dram_cycles",
+    "stage_cycles",
+    "prologue_cycles",
+    "epilogue_cycles",
+    "cta_cycles",
+    "compute_smem_overlap_factor",
+    "compute_l2_overlap_factor",
+    "compute_dram_overlap_factor",
+    "smem_flop_per_byte",
+    "l2_flop_per_byte",
+    "dram_flop_per_byte",
+    "merged_flop_per_byte",
+    "roofline_bound_compute_flop_per_cycle",
+    "roofline_bound_smem_flop_per_cycle",
+    "roofline_bound_l2_flop_per_cycle",
+    "roofline_bound_dram_flop_per_cycle",
+    "hbm_memory_latency_s",
+    "l2_memory_latency_s",
+    "sram_memory_latency_s",
+    "register_memory_latency_s",
+    "primary_bottleneck",
+    "secondary_bottlenecks",
+    "warnings",
+    "assumptions",
 )

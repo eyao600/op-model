@@ -1,0 +1,30 @@
+name: mlp_up_projection_extended_roofline
+kind: gemm
+phase: train_fwd
+attrs:
+  transpose_a: false
+  transpose_b: false
+  cta_tile_m: 128
+  cta_tile_n: 128
+  cta_tile_k: 32
+  warp_tile_m: 64
+  warp_tile_n: 64
+  warp_tile_k: 32
+  mma_m: 16
+  mma_n: 8
+  mma_k: 16
+  pipeline_stages: 3
+  warps_per_cta: 4
+  threads_per_cta: 128
+  registers_per_thread: 64
+  beta_zero: true
+tensors:
+  - role: input
+    shape: [4096, 8192]
+    dtype: bf16
+  - role: weight
+    shape: [8192, 32768]
+    dtype: bf16
+  - role: output
+    shape: [4096, 32768]
+    dtype: bf16

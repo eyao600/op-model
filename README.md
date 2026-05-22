@@ -58,6 +58,23 @@ opmodel predict \
 
 The command writes JSON to stdout.
 
+An opt-in extended GEMM roofline model is also available:
+
+```bash
+opmodel predict \
+  --model extended_roofline \
+  --hardware src/opmodel/configs/hardware/a10.yaml \
+  --op examples/gemm_extended_roofline.yaml
+```
+
+For GEMM and batched GEMM, `extended_roofline` estimates CTA tiling,
+first-touch L2 reuse, SMEM/L2/DRAM active utilization, compute-memory overlap,
+and likely bottlenecks. Kernel parameters such as `cta_tile_m`, `cta_tile_n`,
+`cta_tile_k`, `warp_tile_m`, `warp_tile_n`, `pipeline_stages`,
+`warps_per_cta`, and `registers_per_thread` may be provided in op `attrs`;
+conservative defaults are used when they are omitted. Non-GEMM ops reuse the
+standard `roofline` estimators.
+
 To compare bf16 predictions against the EnergAIzer artifact data and write a
 normalized SVG scatter plot:
 

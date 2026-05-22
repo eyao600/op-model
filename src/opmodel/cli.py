@@ -17,6 +17,7 @@ from opmodel.validation.artifact_accuracy import (
     format_text_report,
     run_artifact_validation,
     write_csv_report,
+    write_performance_details_csv_report,
     write_validation_plots,
 )
 
@@ -36,8 +37,14 @@ def main(argv: list[str] | None = None) -> int:
     validate_parser.add_argument("--model", default="roofline")
     validate_parser.add_argument("--limit", type=int, help="maximum supported rows per CSV file")
     validate_parser.add_argument("--output-csv")
+    validate_parser.add_argument("--output-details-csv")
     validate_parser.add_argument("--output-plot", default="artifact_accuracy.svg")
     validate_parser.add_argument("--no-plot", action="store_true")
+    validate_parser.add_argument(
+        "--workload-y-max",
+        type=float,
+        help="fixed y-axis maximum for generated workload bar plots",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "predict":
@@ -56,12 +63,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.output_csv:
             write_csv_report(report, args.output_csv)
+        if args.output_details_csv:
+            write_performance_details_csv_report(report, args.output_details_csv)
         plot_paths = ()
         if not args.no_plot and args.output_plot:
-            plot_paths = write_validation_plots(report, args.output_plot)
+            plot_paths = write_validation_plots(
+                report,
+                args.output_plot,
+                workload_y_max=args.workload_y_max,
+            )
         print(format_text_report(report))
         if args.output_csv:
             print(f"Wrote CSV report: {args.output_csv}")
+        if args.output_details_csv:
+            print(f"Wrote performance details CSV report: {args.output_details_csv}")
         for plot_path in plot_paths:
             print(f"Wrote normalized plot: {plot_path}")
         return 0
