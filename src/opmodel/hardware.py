@@ -55,6 +55,7 @@ class HardwareSpec:
     memory_levels: Mapping[str, MemoryLevel]
     utilization: Utilization = field(default_factory=Utilization)
     kernel_launch_overhead_s: float = 0.0
+    static_power_w: float = 0.0
 
 
 def load_hardware(path: str | Path) -> HardwareSpec:
@@ -147,6 +148,7 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
         memory_levels=memory_levels,
         utilization=utilization,
         kernel_launch_overhead_s=float(data.get("kernel_launch_overhead_s", 0.0)),
+        static_power_w=float(data.get("static_power_w", 0.0)),
     )
 
 
@@ -191,6 +193,8 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
             raise ValueError(f"compute.{field_name} must be positive")
     if hardware.kernel_launch_overhead_s < 0:
         raise ValueError("kernel_launch_overhead_s must be non-negative")
+    if hardware.static_power_w < 0:
+        raise ValueError("static_power_w must be non-negative")
 
     for level in hardware.memory_levels.values():
         if level.bandwidth_bytes_per_s <= 0:

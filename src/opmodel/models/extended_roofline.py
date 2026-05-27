@@ -194,6 +194,7 @@ class ExtendedGemmEstimator:
             engine=EngineKind.TENSOR,
             dtype=problem.input_dtype,
             hardware=hardware,
+            latency_s=latency_s,
         )
 
         diagnostics = _diagnostics(

@@ -13,6 +13,7 @@ def estimate_energy(
     engine: EngineKind,
     dtype: DType,
     hardware: HardwareSpec,
+    latency_s: float = 0.0,
 ) -> EnergyBreakdown:
     compute_energy = flops * _energy_per_flop(engine, dtype, hardware)
     if memory_access is None:
@@ -40,6 +41,7 @@ def estimate_energy(
             memory_access.register_write_bytes,
             hardware,
         ),
+        static_j=hardware.static_power_w * latency_s,
     )
 
 

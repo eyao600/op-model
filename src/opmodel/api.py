@@ -108,10 +108,18 @@ class EnergyBreakdown:
     l2_j: float = 0.0
     sram_j: float = 0.0
     register_j: float = 0.0
+    static_j: float = 0.0
 
     @property
     def total_j(self) -> float:
-        return self.compute_j + self.hbm_j + self.l2_j + self.sram_j + self.register_j
+        return (
+            self.compute_j
+            + self.hbm_j
+            + self.l2_j
+            + self.sram_j
+            + self.register_j
+            + self.static_j
+        )
 
 
 @dataclass(frozen=True)

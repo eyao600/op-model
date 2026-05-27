@@ -311,6 +311,7 @@ def _make_profile(
         engine=engine,
         dtype=dtype,
         hardware=hardware,
+        latency_s=latency,
     )
     traffic = _total_memory_traffic(memory_access)
     base_diagnostics = {

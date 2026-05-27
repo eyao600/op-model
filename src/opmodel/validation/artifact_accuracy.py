@@ -260,10 +260,22 @@ def write_validation_plots(
     scatter_path = Path(path)
     gemm_path = _derived_plot_path(scatter_path, "gemm_workloads")
     softmax_path = _derived_plot_path(scatter_path, "softmax_workloads")
+    energy_breakdown_path = _derived_plot_path(
+        scatter_path, "energy_breakdown_workloads"
+    )
     write_normalized_scatter_plot(report, scatter_path)
     write_gemm_workload_bar_plot(report, gemm_path, y_max=workload_y_max)
     write_softmax_workload_bar_plot(report, softmax_path, y_max=workload_y_max)
-    return (scatter_path, gemm_path, softmax_path)
+    write_energy_breakdown_workload_plot(report, energy_breakdown_path)
+    return (scatter_path, gemm_path, softmax_path, energy_breakdown_path)
+
+
+def write_energy_breakdown_workload_plot(
+    report: ArtifactValidationReport, path: str | Path
+) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(_energy_breakdown_workload_plot_svg(report), encoding="utf-8")
 
 
 def write_normalized_bar_plot(report: ArtifactValidationReport, path: str | Path) -> None:
@@ -487,6 +499,12 @@ def _performance_details_row(
         "measured_energy_j": accuracy_row.measured_energy_j,
         "predicted_energy_j": accuracy_row.predicted_energy_j,
         "energy_ratio": accuracy_row.energy_ratio,
+        "compute_energy_j": profile.energy_breakdown.compute_j,
+        "dram_energy_j": profile.energy_breakdown.hbm_j,
+        "l2_energy_j": profile.energy_breakdown.l2_j,
+        "smem_energy_j": profile.energy_breakdown.sram_j,
+        "static_power_w": hardware.static_power_w,
+        "static_energy_j": profile.energy_breakdown.static_j,
         "flops": profile.flops,
         "predicted_elapsed_cycles": diagnostics.get("predicted_elapsed_cycles"),
         "clock_hz": diagnostics.get("clock_hz"),
@@ -917,6 +935,15 @@ class _WorkloadSpec:
     working_set_bytes: int
 
 
+@dataclass(frozen=True)
+class _EnergyBreakdownWorkloadPoint:
+    workload: str
+    hardware: str
+    components: Mapping[str, float]
+    total_ratio: float
+    count: int
+
+
 def _normalized_scatter_plot_svg(rows: tuple[ArtifactAccuracyRow, ...]) -> str:
     points = tuple(_scatter_point(row) for row in rows)
     if not points:
@@ -1102,6 +1129,305 @@ def _softmax_workload_bar_plot_svg(
         points=points,
         y_max=y_max,
     )
+
+
+_ENERGY_COMPONENTS = (
+    ("static", "static", "#7c3aed"),
+    ("compute", "compute", "#dc2626"),
+    ("dram", "DRAM", "#2563eb"),
+    ("l2", "L2", "#0891b2"),
+    ("smem", "SMEM", "#16a34a"),
+)
+
+
+def _energy_breakdown_workload_plot_svg(report: ArtifactValidationReport) -> str:
+    if not report.performance_details:
+        return (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="720" height="220" '
+            'viewBox="0 0 720 220">'
+            '<rect width="720" height="220" fill="white"/>'
+            '<text x="28" y="42" font-family="Arial, sans-serif" font-size="18" '
+            'font-weight="700">Workload energy breakdown ratios</text>'
+            '<text x="28" y="84" font-family="Arial, sans-serif" font-size="14">'
+            "No performance details available"
+            "</text></svg>\n"
+        )
+
+    gemm_workloads = tuple(
+        sorted(
+            (
+                _WorkloadSpec(
+                    key=f"B{batch}_MNK{mnk}",
+                    label=f"B{batch}/MNK{mnk}",
+                    working_set_bytes=_gemm_square_working_set_bytes(batch, mnk),
+                )
+                for batch in _GEMM_WORKLOAD_BATCHES
+                for mnk in _GEMM_WORKLOAD_MNKS
+            ),
+            key=lambda workload: (workload.working_set_bytes, workload.label),
+        )
+    )
+    softmax_workloads = tuple(
+        sorted(
+            (
+                _WorkloadSpec(
+                    key=f"B{batch}_D{dim}",
+                    label=f"B2^{int(math.log2(batch))}/D{dim}",
+                    working_set_bytes=_softmax_working_set_bytes(batch, dim),
+                )
+                for batch in _SOFTMAX_WORKLOAD_BATCHES
+                for dim in _SOFTMAX_WORKLOAD_DIMS
+            ),
+            key=lambda workload: (workload.working_set_bytes, workload.label),
+        )
+    )
+
+    def gemm_workload_for_detail(values: Mapping[str, Any]) -> str | None:
+        if values.get("op_kind") != OpKind.BATCHED_GEMM.value:
+            return None
+        dimensions = _parse_dimensions(str(values["dimensions"]))
+        batch = int(dimensions["batch"])
+        m = int(dimensions["M"])
+        n = int(dimensions["N"])
+        k = int(dimensions["K"])
+        if (
+            batch in _GEMM_WORKLOAD_BATCHES
+            and m == n
+            and n == k
+            and m in _GEMM_WORKLOAD_MNKS
+        ):
+            return f"B{batch}_MNK{m}"
+        return None
+
+    def softmax_workload_for_detail(values: Mapping[str, Any]) -> str | None:
+        if values.get("op_kind") != OpKind.SOFTMAX.value:
+            return None
+        dimensions = _parse_dimensions(str(values["dimensions"]))
+        batch = int(dimensions["batch"])
+        dim = int(dimensions["dim"])
+        if batch in _SOFTMAX_WORKLOAD_BATCHES and dim in _SOFTMAX_WORKLOAD_DIMS:
+            return f"B{batch}_D{dim}"
+        return None
+
+    gemm_points = _energy_breakdown_workload_points(
+        report.performance_details, gemm_workload_for_detail
+    )
+    softmax_points = _energy_breakdown_workload_points(
+        report.performance_details, softmax_workload_for_detail
+    )
+    if not gemm_points and not softmax_points:
+        return (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="720" height="220" '
+            'viewBox="0 0 720 220">'
+            '<rect width="720" height="220" fill="white"/>'
+            '<text x="28" y="42" font-family="Arial, sans-serif" font-size="18" '
+            'font-weight="700">Workload energy breakdown ratios</text>'
+            '<text x="28" y="84" font-family="Arial, sans-serif" font-size="14">'
+            "No matching workloads in report"
+            "</text></svg>\n"
+        )
+
+    hardware_order = tuple(
+        sorted({point.hardware for point in (*gemm_points, *softmax_points)})
+    )
+    left = 72
+    right = 28
+    top = 104
+    panel_height = 205
+    panel_gap = 130
+    bottom = 118
+    group_width = max(76, 32 + len(hardware_order) * 18)
+    max_workload_count = max(len(gemm_workloads), len(softmax_workloads))
+    width = left + right + group_width * max_workload_count
+    top_gemm = top
+    top_softmax = top_gemm + panel_height + panel_gap
+    height = top_softmax + panel_height + bottom
+    y_max = _nice_axis_limit(
+        max(1.0, *(point.total_ratio for point in (*gemm_points, *softmax_points))) * 1.15
+    )
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        (
+            f'<text x="{left}" y="26" font-family="Arial, sans-serif" '
+            'font-size="18" font-weight="700">Workload energy breakdown ratios</text>'
+        ),
+        (
+            f'<text x="{left}" y="48" font-family="Arial, sans-serif" '
+            'font-size="12" fill="#4b5563">Stacked components are component energy / '
+            "measured energy; a10 and a100 bars are side by side per workload</text>"
+        ),
+    ]
+
+    legend_x = left
+    for _key, label, color in _ENERGY_COMPONENTS:
+        parts.append(
+            f'<rect x="{legend_x}" y="68" width="11" height="11" fill="{color}"/>'
+        )
+        parts.append(
+            f'<text x="{legend_x + 17}" y="78" font-family="Arial, sans-serif" '
+            f'font-size="12">{escape(label)}</text>'
+        )
+        legend_x += 86
+    hardware_order_label = " / ".join(hardware_order)
+    parts.append(
+        f'<text x="{legend_x + 10}" y="78" font-family="Arial, sans-serif" '
+        f'font-size="12" fill="#4b5563">bar order: {escape(hardware_order_label)}</text>'
+    )
+
+    _append_energy_breakdown_panel(
+        parts=parts,
+        title="Square GEMM energy predicted / measured",
+        workloads=gemm_workloads,
+        points=gemm_points,
+        hardware_order=hardware_order,
+        left=left,
+        top=top_gemm,
+        width=width,
+        right=right,
+        panel_height=panel_height,
+        group_width=group_width,
+        y_max=y_max,
+    )
+    _append_energy_breakdown_panel(
+        parts=parts,
+        title="Softmax energy predicted / measured",
+        workloads=softmax_workloads,
+        points=softmax_points,
+        hardware_order=hardware_order,
+        left=left,
+        top=top_softmax,
+        width=width,
+        right=right,
+        panel_height=panel_height,
+        group_width=group_width,
+        y_max=y_max,
+    )
+    parts.append("</svg>\n")
+    return "\n".join(parts)
+
+
+def _energy_breakdown_workload_points(
+    details: tuple[ArtifactPerformanceDetailsRow, ...],
+    workload_for_detail: Any,
+) -> tuple[_EnergyBreakdownWorkloadPoint, ...]:
+    groups: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for detail in details:
+        workload = workload_for_detail(detail.values)
+        if workload is not None:
+            groups[(workload, str(detail.values["hardware"]))].append(detail.values)
+
+    points: list[_EnergyBreakdownWorkloadPoint] = []
+    for (workload, hardware), grouped_details in sorted(groups.items()):
+        component_values: dict[str, float] = {}
+        for key, _label, _color in _ENERGY_COMPONENTS:
+            field = f"{key}_energy_j"
+            component_values[key] = _mean(
+                _float_or_zero(values.get(field)) / _float_or_zero(values["measured_energy_j"])
+                for values in grouped_details
+                if _float_or_zero(values["measured_energy_j"]) > 0.0
+            )
+        total_ratio = sum(component_values.values())
+        points.append(
+            _EnergyBreakdownWorkloadPoint(
+                workload=workload,
+                hardware=hardware,
+                components=component_values,
+                total_ratio=total_ratio,
+                count=len(grouped_details),
+            )
+        )
+    return tuple(points)
+
+
+def _append_energy_breakdown_panel(
+    *,
+    parts: list[str],
+    title: str,
+    workloads: tuple[_WorkloadSpec, ...],
+    points: tuple[_EnergyBreakdownWorkloadPoint, ...],
+    hardware_order: tuple[str, ...],
+    left: int,
+    top: int,
+    width: int,
+    right: int,
+    panel_height: int,
+    group_width: int,
+    y_max: float,
+) -> None:
+    points_by_key = {(point.workload, point.hardware): point for point in points}
+
+    def y_for_ratio(value: float) -> float:
+        return top + panel_height - (value / y_max) * panel_height
+
+    parts.append(
+        f'<text x="{left}" y="{top - 14}" font-family="Arial, sans-serif" '
+        f'font-size="13" font-weight="700">{escape(title)}</text>'
+    )
+    parts.append(
+        f'<line x1="{left}" y1="{top + panel_height}" x2="{width - right}" '
+        f'y2="{top + panel_height}" stroke="#333"/>'
+    )
+    parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + panel_height}" stroke="#333"/>')
+
+    for tick in range(5):
+        value = y_max * tick / 4
+        y = y_for_ratio(value)
+        parts.append(
+            f'<line x1="{left - 4}" y1="{y:.2f}" x2="{width - right}" '
+            f'y2="{y:.2f}" stroke="#e5e7eb"/>'
+        )
+        parts.append(
+            f'<text x="{left - 10}" y="{y + 4:.2f}" text-anchor="end" '
+            f'font-family="Arial, sans-serif" font-size="10">{value:.2g}</text>'
+        )
+
+    perfect_y = y_for_ratio(1.0)
+    parts.append(
+        f'<line x1="{left}" y1="{perfect_y:.2f}" x2="{width - right}" '
+        f'y2="{perfect_y:.2f}" stroke="#111827" stroke-dasharray="5 4"/>'
+    )
+    parts.append(
+        f'<text x="{width - right - 4}" y="{perfect_y - 6:.2f}" text-anchor="end" '
+        'font-family="Arial, sans-serif" font-size="10">1.0 measured energy</text>'
+    )
+
+    bar_width = 12
+    bar_gap = 4
+    total_bar_width = len(hardware_order) * bar_width + (len(hardware_order) - 1) * bar_gap
+    label_y = top + panel_height + 22
+    hardware_label_y = top + panel_height + 38
+    for index, workload in enumerate(workloads):
+        center = left + (index + 0.5) * group_width
+        start_x = center - total_bar_width / 2
+        for hardware_index, hardware in enumerate(hardware_order):
+            point = points_by_key.get((workload.key, hardware))
+            if point is None:
+                continue
+            x = start_x + hardware_index * (bar_width + bar_gap)
+            stack_base = top + panel_height
+            for key, _label, color in _ENERGY_COMPONENTS:
+                value = max(0.0, point.components.get(key, 0.0))
+                height = min(value, y_max) / y_max * panel_height
+                y = stack_base - height
+                parts.append(
+                    f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width}" '
+                    f'height="{height:.2f}" fill="{color}"/>'
+                )
+                stack_base = y
+            parts.append(
+                f'<text x="{x + bar_width / 2:.2f}" y="{hardware_label_y}" '
+                'text-anchor="middle" font-family="Arial, sans-serif" font-size="8">'
+                f"{escape(_short_hardware_label(hardware))}</text>"
+            )
+        parts.append(
+            f'<text x="{center:.2f}" y="{label_y}" text-anchor="end" '
+            'font-family="Arial, sans-serif" font-size="10" '
+            f'transform="rotate(-45 {center:.2f} {label_y})">'
+            f"{escape(workload.label)}</text>"
+        )
 
 
 def _normalized_workload_bar_plot_svg(
@@ -1446,6 +1772,18 @@ def _parse_dimensions(value: str) -> dict[str, str]:
     return result
 
 
+def _float_or_zero(value: Any) -> float:
+    if value is None or value == "":
+        return 0.0
+    return float(value)
+
+
+def _short_hardware_label(hardware: str) -> str:
+    if hardware == "a100_40gb_pcie":
+        return "a100"
+    return hardware
+
+
 def _hardware_colors(hardware_order: tuple[str, ...]) -> dict[str, str]:
     palette = ("#2563eb", "#f97316", "#16a34a", "#9333ea", "#dc2626", "#0891b2")
     return {hardware: palette[index % len(palette)] for index, hardware in enumerate(hardware_order)}
@@ -1545,6 +1883,12 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "measured_energy_j",
     "predicted_energy_j",
     "energy_ratio",
+    "compute_energy_j",
+    "dram_energy_j",
+    "l2_energy_j",
+    "smem_energy_j",
+    "static_power_w",
+    "static_energy_j",
     "flops",
     "predicted_elapsed_cycles",
     "clock_hz",
