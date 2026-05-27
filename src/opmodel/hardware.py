@@ -38,6 +38,7 @@ class ComputeUnit:
     shared_memory_bytes_per_sm: int | None = None
     max_async_copy_groups: int | None = None
     tensor_latency_cycles: int | None = None
+    device_fixed_overhead_cycles: int | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,9 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
         ),
         max_async_copy_groups=_optional_int(compute_data.get("max_async_copy_groups")),
         tensor_latency_cycles=_optional_int(compute_data.get("tensor_latency_cycles")),
+        device_fixed_overhead_cycles=_optional_int(
+            compute_data.get("device_fixed_overhead_cycles")
+        ),
     )
 
     memory_data = _expect_mapping(data.get("memory", {}), "memory")
@@ -187,6 +191,7 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
         "shared_memory_bytes_per_sm",
         "max_async_copy_groups",
         "tensor_latency_cycles",
+        "device_fixed_overhead_cycles",
     ):
         value = getattr(hardware.compute, field_name)
         if value is not None and value <= 0:

@@ -1,5 +1,7 @@
 name: a100_40gb_pcie
 kind: gpu
+# Minimum measured average power from EnergAIzer database/data yz8_*freq900*.csv.
+static_power_w: 47.939551350932
 
 # Derived from EnergAIzer config/gpu/yz8.yaml.
 # Peak FLOPs are scaled from sm_max_freq=1410 MHz to the measured LUT
@@ -7,6 +9,8 @@ kind: gpu
 # derived from power_cap divided by the corresponding peak throughput.
 compute:
   clock_hz: 9.0e8
+  # Calibrated from median small/small-skinny GEMM residuals at 900 MHz.
+  device_fixed_overhead_cycles: 22400
   num_sms: 108
   fma_dims: [16, 8, 16]
   dataflow: output_stationary
@@ -27,8 +31,8 @@ compute:
   tensor_energy_j_per_flop:
     fp64: 2.0085470085470086e-11
     tf32: 2.5106837606837607e-12
-    bf16: 1.2553418803418803e-12
-    fp16: 1.2553418803418803e-12
+    bf16: 0.7e-12 # 1.2553418803418803e-12
+    fp16: 0.7e-12 # 1.2553418803418803e-12
     int8: 6.276709401709402e-13
 
 memory:
@@ -36,11 +40,11 @@ memory:
     - name: l2
       size_bytes: 41943040
       bandwidth_bytes_per_s: 4.608e12
-      energy_j_per_byte: 5.425347222222222e-11
+      energy_j_per_byte: 3.768e-11 # 5.425347222222222e-11
     - name: hbm
       size_bytes: 42949672960
       bandwidth_bytes_per_s: 1.555e12
-      energy_j_per_byte: 1.607717041800643e-10
+      energy_j_per_byte: 1.0488e-10 # 1.607717041800643e-10
 
 utilization:
   vector: 1.0

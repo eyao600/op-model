@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import csv
 import math
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from html import escape
@@ -26,6 +28,35 @@ _GEMM_WORKLOAD_BATCHES = (16, 32, 64, 128)
 _GEMM_WORKLOAD_MNKS = (256, 512, 1024, 2048)
 _SOFTMAX_WORKLOAD_BATCHES = tuple(2**power for power in range(13, 20))
 _SOFTMAX_WORKLOAD_DIMS = (512, 1024)
+_TENSOROP_WARP_SHAPES = {
+    "884": ((32, 32, 4), (32, 64, 4), (64, 32, 4), (64, 64, 4)),
+    "1688": ((32, 32, 8), (32, 64, 8), (64, 32, 8), (64, 64, 8)),
+    "16816": ((32, 32, 16), (32, 64, 16), (64, 32, 16), (64, 64, 16)),
+    "8816": ((32, 32, 16), (32, 64, 16), (64, 32, 16), (64, 64, 16)),
+    "8832": ((32, 32, 32), (32, 64, 32), (64, 32, 32), (64, 64, 32)),
+    "16832": ((32, 32, 32), (32, 64, 32), (64, 32, 32), (64, 64, 32)),
+    "16864": ((32, 32, 64), (32, 64, 64), (64, 32, 64), (64, 64, 64)),
+    "88128": ((32, 32, 128), (32, 64, 128), (64, 32, 128), (64, 64, 128)),
+    "168256": ((32, 32, 256), (32, 64, 256), (64, 32, 256), (64, 64, 256)),
+    "161616": ((32, 32, 16), (32, 64, 16), (64, 32, 16)),
+    "83216": ((32, 32, 16), (32, 64, 16), (64, 32, 16)),
+    "32816": ((32, 32, 16), (32, 64, 16), (64, 32, 16)),
+}
+_TENSOROP_MATH_INST = {
+    "884": (8, 8, 4),
+    "1688": (16, 8, 8),
+    "16816": (16, 8, 16),
+    "8816": (8, 8, 16),
+    "8832": (8, 8, 32),
+    "16832": (16, 8, 32),
+    "16864": (16, 8, 64),
+    "88128": (8, 8, 128),
+    "168256": (16, 8, 256),
+    "161616": (16, 16, 16),
+    "83216": (8, 32, 16),
+    "32816": (32, 8, 16),
+}
+_CUDA_CORE_GEMM_KERNEL_MARKERS = ("gemv2t", "gemvnsp")
 
 
 @dataclass(frozen=True)
@@ -357,6 +388,7 @@ def _gemm_sample(
     b_shape = (batch, dim_n, dim_k) if transpose_b else (batch, dim_k, dim_n)
     c_shape = (batch, dim_m, dim_n)
     attrs = {"transpose_a": transpose_a, "transpose_b": transpose_b}
+    attrs.update(_gemm_kernel_attrs(row, batch, dim_m, dim_n, dim_k))
     dimensions = {
         "batch": batch,
         "M": dim_m,
@@ -374,6 +406,405 @@ def _gemm_sample(
             TensorSpec(TensorRole.WEIGHT, b_shape, DType.BF16),
             TensorSpec(TensorRole.OUTPUT, c_shape, DType.BF16),
         ),
+    )
+
+
+def _gemm_kernel_attrs(
+    row: Mapping[str, str], batch: int, dim_m: int, dim_n: int, dim_k: int
+) -> dict[str, Any]:
+    kernel_name = str(row.get("kernel_name", "")).strip()
+    try:
+        grid_size = _tuple3_field(row, "grid_size")
+        block_size = _tuple3_field(row, "block_size")
+        use_tensor_core = _bool_field(row, "useTensorCore", default=True)
+    except (SyntaxError, TypeError, ValueError):
+        return {}
+    if not kernel_name or grid_size is None or block_size is None:
+        return {}
+
+    query: dict[str, Any] = {
+        "kernel_name": kernel_name,
+        "grid_size": grid_size,
+        "block_size": block_size,
+        "batch": batch,
+        "dimM": dim_m,
+        "dimN": dim_n,
+        "dimK": dim_k,
+        "useTensorCore": use_tensor_core,
+    }
+    parsed = _initial_gemm_kernel_parse()
+    try:
+        _parse_gemm_block(query, parsed)
+        query.update(parsed)
+        _parse_gemm_warp(query, parsed)
+    except (IndexError, KeyError, TypeError, ValueError, ZeroDivisionError):
+        return {}
+
+    required = (
+        "block_tile_M",
+        "block_tile_N",
+        "block_tile_K",
+        "warp_tile_M",
+        "warp_tile_N",
+        "warp_tile_K",
+        "num_warp_tile_K",
+        "math_inst_M",
+        "math_inst_N",
+        "math_inst_K",
+        "multistageK",
+        "n_warps_per_block",
+        "threads",
+    )
+    if any(parsed[key] <= 0 for key in required):
+        return {}
+
+    attrs: dict[str, Any] = {
+        "cta_tile_m": int(parsed["block_tile_M"]),
+        "cta_tile_n": int(parsed["block_tile_N"]),
+        "cta_tile_k": int(parsed["block_tile_K"]),
+        "warp_tile_m": int(parsed["warp_tile_M"]),
+        "warp_tile_n": int(parsed["warp_tile_N"]),
+        "warp_tile_k": int(parsed["warp_tile_K"]),
+        "num_warp_tile_k": int(parsed["num_warp_tile_K"]),
+        "mma_m": int(parsed["math_inst_M"]),
+        "mma_n": int(parsed["math_inst_N"]),
+        "mma_k": int(parsed["math_inst_K"]),
+        "pipeline_stages": int(parsed["multistageK"]),
+        "warps_per_cta": int(parsed["n_warps_per_block"]),
+        "threads_per_cta": int(parsed["threads"]),
+        "slice_k": bool(parsed["sliceK"]),
+    }
+    max_concurrent_block = _optional_positive_int_field(row, "max_concurrent_block")
+    if max_concurrent_block is not None:
+        attrs["max_concurrent_block"] = max_concurrent_block
+    return attrs
+
+
+def _initial_gemm_kernel_parse() -> dict[str, Any]:
+    return {
+        "use_cuda_core_only": False,
+        "gemv": False,
+        "block_tile_M": -1,
+        "block_tile_N": -1,
+        "block_tile_K": -1,
+        "num_block_tile_batch": -1,
+        "num_block_tile_M": -1,
+        "num_block_tile_N": -1,
+        "num_block_tile_K": -1,
+        "total_block_tiles": -1,
+        "splitK": -1,
+        "totalK": -1,
+        "splitK_batch": -1,
+        "stagesK": -1,
+        "multistageK": -1,
+        "threads": -1,
+        "n_warps_per_block": -1,
+        "warp_tile_M": -1,
+        "warp_tile_N": -1,
+        "warp_tile_K": -1,
+        "num_warp_tile_M": -1,
+        "num_warp_tile_N": -1,
+        "num_warp_tile_K": -1,
+        "math_inst_M": -1,
+        "math_inst_N": -1,
+        "math_inst_K": -1,
+        "sliceK": -1,
+        "groupsK": -1,
+    }
+
+
+def _parse_gemm_block(query: Mapping[str, Any], parsed: dict[str, Any]) -> None:
+    kernel_name = str(query["kernel_name"]).lower()
+    grid_size = query["grid_size"]
+    num_grid_blocks = grid_size[0] * grid_size[1] * grid_size[2]
+
+    if "gemv" in kernel_name:
+        parsed["gemv"] = True
+        possible_splitk = grid_size[2] != 1 and grid_size[2] == query["batch"]
+        parsed["total_block_tiles"] = num_grid_blocks
+        if query["dimM"] == 1 or query["dimN"] == 1:
+            parsed["num_block_tile_batch"] = query["batch"]
+            if not possible_splitk:
+                if query["dimM"] == 1:
+                    parsed["num_block_tile_M"] = 1
+                    parsed["num_block_tile_N"] = int(
+                        parsed["total_block_tiles"]
+                        / parsed["num_block_tile_batch"]
+                    )
+                else:
+                    parsed["num_block_tile_M"] = int(
+                        parsed["total_block_tiles"]
+                        / parsed["num_block_tile_batch"]
+                    )
+                    parsed["num_block_tile_N"] = 1
+            elif query["dimM"] == 1:
+                parsed["num_block_tile_M"] = 1
+                parsed["num_block_tile_N"] = grid_size[0] * grid_size[1]
+            else:
+                parsed["num_block_tile_M"] = grid_size[0] * grid_size[1]
+                parsed["num_block_tile_N"] = 1
+        else:
+            parsed["num_block_tile_M"] = grid_size[0]
+            parsed["num_block_tile_N"] = grid_size[1]
+            parsed["num_block_tile_batch"] = query["batch"]
+
+        parsed["block_tile_M"] = math.ceil(query["dimM"] / parsed["num_block_tile_M"])
+        parsed["block_tile_N"] = math.ceil(query["dimN"] / parsed["num_block_tile_N"])
+        num_block_tile = (
+            parsed["num_block_tile_batch"]
+            * parsed["num_block_tile_M"]
+            * parsed["num_block_tile_N"]
+        )
+        if parsed["total_block_tiles"] != num_block_tile:
+            parsed["splitK_batch"] = int(num_grid_blocks / num_block_tile)
+            if parsed["splitK_batch"] <= 0:
+                raise ValueError("invalid gemv splitK")
+            parsed["splitK"] = True
+            parsed["totalK"] = math.ceil(query["dimK"] / parsed["splitK_batch"])
+            parsed["num_block_tile_batch"] *= parsed["splitK_batch"]
+        else:
+            parsed["splitK"] = False
+            parsed["totalK"] = query["dimK"]
+            parsed["splitK_batch"] = -1
+
+        parsed["block_tile_K"] = min(32 if query["useTensorCore"] else 8, query["dimK"])
+        parsed["stagesK"] = math.ceil(parsed["totalK"] / parsed["block_tile_K"])
+        parsed["multistageK"] = 2
+        parsed["use_cuda_core_only"] = any(
+            marker in kernel_name for marker in _CUDA_CORE_GEMM_KERNEL_MARKERS
+        )
+        if (query["dimM"] == 1 or query["dimN"] == 1) and query["dimK"] == 1:
+            parsed["use_cuda_core_only"] = True
+
+    elif "largek" in kernel_name:
+        parsed["gemv"] = True
+        parsed["total_block_tiles"] = num_grid_blocks
+        parsed["num_block_tile_batch"] = query["batch"] * grid_size[2]
+        if query["dimM"] < query["dimN"]:
+            parsed["num_block_tile_M"] = 1
+            parsed["num_block_tile_N"] = grid_size[0] * grid_size[1]
+        else:
+            parsed["num_block_tile_M"] = grid_size[0] * grid_size[1]
+            parsed["num_block_tile_N"] = 1
+        parsed["block_tile_M"] = math.ceil(query["dimM"] / parsed["num_block_tile_M"])
+        parsed["block_tile_N"] = math.ceil(query["dimN"] / parsed["num_block_tile_N"])
+        parsed["splitK"] = True
+        parsed["totalK"] = math.ceil(query["dimK"] / grid_size[2])
+        parsed["splitK_batch"] = grid_size[2]
+        parsed["block_tile_K"] = min(32 if query["useTensorCore"] else 8, query["dimK"])
+        parsed["stagesK"] = math.ceil(parsed["totalK"] / parsed["block_tile_K"])
+        parsed["multistageK"] = 2
+        parsed["use_cuda_core_only"] = False
+
+    elif "magma_sgemmex" in kernel_name:
+        parsed["gemv"] = False
+        parsed["total_block_tiles"] = num_grid_blocks
+        parsed["num_block_tile_batch"] = query["batch"]
+        if query["dimM"] < query["dimN"]:
+            parsed["num_block_tile_M"] = 1
+            parsed["num_block_tile_N"] = int(parsed["total_block_tiles"] / query["batch"])
+        else:
+            parsed["num_block_tile_M"] = int(parsed["total_block_tiles"] / query["batch"])
+            parsed["num_block_tile_N"] = 1
+        parsed["block_tile_M"] = math.ceil(query["dimM"] / parsed["num_block_tile_M"])
+        parsed["block_tile_N"] = math.ceil(query["dimN"] / parsed["num_block_tile_N"])
+        parsed["splitK"] = False
+        parsed["totalK"] = query["dimK"]
+        parsed["splitK_batch"] = -1
+        parsed["block_tile_K"] = min(32 if query["useTensorCore"] else 8, query["dimK"])
+        parsed["stagesK"] = math.ceil(parsed["totalK"] / parsed["block_tile_K"])
+        parsed["multistageK"] = 2
+        parsed["use_cuda_core_only"] = True
+
+    else:
+        parsed["gemv"] = False
+        shapes = re.findall(r"[0-9]+x[0-9]+", kernel_name)
+        parsed["block_tile_M"], parsed["block_tile_N"] = _parse_x_pair(shapes[0])
+        parsed["num_block_tile_M"] = math.ceil(query["dimM"] / parsed["block_tile_M"])
+        parsed["num_block_tile_N"] = math.ceil(query["dimN"] / parsed["block_tile_N"])
+        parsed["num_block_tile_batch"] = query["batch"]
+        num_block_tile = (
+            parsed["num_block_tile_batch"]
+            * parsed["num_block_tile_M"]
+            * parsed["num_block_tile_N"]
+        )
+        if num_block_tile != num_grid_blocks:
+            parsed["splitK_batch"] = int(num_grid_blocks / num_block_tile)
+            if parsed["splitK_batch"] == 0:
+                parsed["block_tile_M"], parsed["block_tile_N"] = _parse_x_pair(
+                    shapes[0], transpose=True
+                )
+                parsed["num_block_tile_M"] = math.ceil(
+                    query["dimM"] / parsed["block_tile_M"]
+                )
+                parsed["num_block_tile_N"] = math.ceil(
+                    query["dimN"] / parsed["block_tile_N"]
+                )
+                num_block_tile = (
+                    parsed["num_block_tile_batch"]
+                    * parsed["num_block_tile_M"]
+                    * parsed["num_block_tile_N"]
+                )
+                parsed["splitK_batch"] = int(num_grid_blocks / num_block_tile)
+            if parsed["splitK_batch"] <= 0:
+                raise ValueError("invalid gemm splitK")
+            parsed["totalK"] = math.ceil(query["dimK"] / parsed["splitK_batch"])
+            parsed["num_block_tile_batch"] *= parsed["splitK_batch"]
+            parsed["splitK"] = True
+        else:
+            parsed["totalK"] = query["dimK"]
+            parsed["splitK"] = False
+
+        has_explicit_k_tile = (
+            ("sliced" in kernel_name and len(shapes) > 2)
+            or ("sliced" not in kernel_name and len(shapes) > 1)
+        )
+        if has_explicit_k_tile:
+            parsed["block_tile_K"], parsed["multistageK"] = _parse_x_pair(shapes[-1])
+            parsed["stagesK"] = math.ceil(parsed["totalK"] / parsed["block_tile_K"])
+        if parsed["block_tile_K"] < 0:
+            parsed["block_tile_K"] = min(
+                32 if query["useTensorCore"] else 8, query["dimK"]
+            )
+            parsed["stagesK"] = math.ceil(parsed["totalK"] / parsed["block_tile_K"])
+        if parsed["multistageK"] < 0:
+            parsed["multistageK"] = 2
+
+    parsed["num_block_tile_K"] = math.ceil(parsed["totalK"] / parsed["block_tile_K"])
+    parsed["total_block_tiles"] = (
+        parsed["num_block_tile_batch"]
+        * parsed["num_block_tile_M"]
+        * parsed["num_block_tile_N"]
+    )
+
+
+def _parse_gemm_warp(query: Mapping[str, Any], parsed: dict[str, Any]) -> None:
+    kernel_name = str(query["kernel_name"]).lower()
+    block_size = query["block_size"]
+    parsed["threads"] = block_size[0] * block_size[1] * block_size[2]
+    parsed["n_warps_per_block"] = int(parsed["threads"] / 32)
+    if parsed["n_warps_per_block"] <= 0:
+        raise ValueError("block_size must include at least one warp")
+
+    instruction_matches = re.findall(r"[shi][0-9]+gemm", kernel_name)
+    if query["useTensorCore"] and not query["use_cuda_core_only"]:
+        if len(instruction_matches) == 1:
+            math_inst_shape = instruction_matches[0][1:-4]
+        else:
+            math_inst_shape = "16816"
+            if query["gemv"] and query["block_tile_K"] < 8:
+                math_inst_shape = "1688"
+        warp_shape_candidates = list(_TENSOROP_WARP_SHAPES[math_inst_shape])
+        math_inst_shape_decoded = _TENSOROP_MATH_INST[math_inst_shape]
+        if query["gemv"]:
+            warp_shape_candidates.append(
+                (16, 8, 8) if query["block_tile_K"] < 8 else (16, 8, 16)
+            )
+    else:
+        math_inst_shape_decoded = (1, 1, 1)
+        warp_num_candidates = _factor_pairs(parsed["n_warps_per_block"])
+        warp_shape_candidates_all = [
+            (
+                math.ceil(query["block_tile_M"] / candidate[0]),
+                math.ceil(query["block_tile_N"] / candidate[1]),
+                1,
+            )
+            for candidate in warp_num_candidates
+        ]
+        effective_block_tiles = [
+            (
+                candidate[0] * query["block_tile_M"],
+                candidate[1] * query["block_tile_N"],
+                candidate[2] * query["block_tile_K"],
+            )
+            for candidate in warp_shape_candidates_all
+        ]
+        estimated_smem_to_reg = [
+            (
+                effective_block_tiles[index][0]
+                * effective_block_tiles[index][2]
+                * warp_pair[1]
+                + effective_block_tiles[index][1]
+                * effective_block_tiles[index][2]
+                * warp_pair[0]
+            )
+            for index, warp_pair in enumerate(warp_num_candidates)
+        ]
+        warp_shape_candidates = [
+            warp_shape_candidates_all[
+                estimated_smem_to_reg.index(min(estimated_smem_to_reg))
+            ]
+        ]
+
+    num_warps_per_block_candidates = [
+        math.ceil(query["block_tile_M"] / candidate[0])
+        * math.ceil(query["block_tile_N"] / candidate[1])
+        for candidate in warp_shape_candidates
+    ]
+    filtered = [
+        warp_shape_candidates[index]
+        for index, candidate_warps in enumerate(num_warps_per_block_candidates)
+        if candidate_warps == parsed["n_warps_per_block"]
+    ]
+    if not filtered:
+        slicek_indexes = [
+            index
+            for index, candidate in enumerate(warp_shape_candidates)
+            if candidate[0] <= query["block_tile_M"]
+            and candidate[1] <= query["block_tile_N"]
+        ]
+        if not slicek_indexes:
+            slicek_indexes = list(range(len(warp_shape_candidates)))
+        num_slices_needed = [
+            parsed["n_warps_per_block"] / num_warps_per_block_candidates[index]
+            for index in slicek_indexes
+        ]
+        min_slices_needed = min(num_slices_needed)
+        kernel_warp_tile = warp_shape_candidates[
+            slicek_indexes[num_slices_needed.index(min_slices_needed)]
+        ]
+    else:
+        if len(filtered) > 1:
+            effective_block_tiles = [
+                (
+                    candidate[0] * query["block_tile_M"],
+                    candidate[1] * query["block_tile_N"],
+                    candidate[2] * query["block_tile_K"],
+                )
+                for candidate in filtered
+            ]
+            estimated_smem_to_reg = [
+                (
+                    effective_block_tiles[index][0]
+                    * effective_block_tiles[index][2]
+                    * candidate[1]
+                    + effective_block_tiles[index][1]
+                    * effective_block_tiles[index][2]
+                    * candidate[0]
+                )
+                for index, candidate in enumerate(filtered)
+            ]
+            kernel_warp_tile = filtered[
+                estimated_smem_to_reg.index(min(estimated_smem_to_reg))
+            ]
+        else:
+            kernel_warp_tile = filtered[0]
+        min_slices_needed = 1
+
+    num_warp_tile_k = int(math.ceil(min_slices_needed))
+    parsed["warp_tile_M"] = kernel_warp_tile[0]
+    parsed["warp_tile_N"] = kernel_warp_tile[1]
+    parsed["warp_tile_K"] = kernel_warp_tile[2]
+    parsed["num_warp_tile_M"] = math.ceil(query["block_tile_M"] / kernel_warp_tile[0])
+    parsed["num_warp_tile_N"] = math.ceil(query["block_tile_N"] / kernel_warp_tile[1])
+    parsed["num_warp_tile_K"] = num_warp_tile_k
+    parsed["math_inst_M"] = math_inst_shape_decoded[0]
+    parsed["math_inst_N"] = math_inst_shape_decoded[1]
+    parsed["math_inst_K"] = math_inst_shape_decoded[2]
+    parsed["sliceK"] = min_slices_needed > 1
+    parsed["groupsK"] = math.ceil(
+        math.ceil(query["block_tile_K"] / max(min_slices_needed, 1.0e-12))
+        / kernel_warp_tile[2]
     )
 
 
@@ -507,8 +938,18 @@ def _performance_details_row(
         "static_energy_j": profile.energy_breakdown.static_j,
         "flops": profile.flops,
         "predicted_elapsed_cycles": diagnostics.get("predicted_elapsed_cycles"),
+        "modeled_device_cycles": diagnostics.get("modeled_device_cycles"),
+        "device_fixed_overhead_cycles": diagnostics.get(
+            "device_fixed_overhead_cycles"
+        ),
+        "total_device_cycles": diagnostics.get("total_device_cycles"),
+        "device_fixed_overhead_s": diagnostics.get("device_fixed_overhead_s"),
+        "device_fixed_overhead_fraction": diagnostics.get(
+            "device_fixed_overhead_fraction"
+        ),
         "clock_hz": diagnostics.get("clock_hz"),
         "predicted_flop_per_cycle": diagnostics.get("predicted_flop_per_cycle"),
+        "modeled_flop_per_cycle": diagnostics.get("modeled_flop_per_cycle"),
         "predicted_tflops_per_s": diagnostics.get("predicted_tflops_per_s"),
         "achieved_flops_per_s": (profile.flops / predicted_latency_s)
         if predicted_latency_s
@@ -547,6 +988,9 @@ def _performance_details_row(
         "warp_tile_m": _diagnostic_value(diagnostics, "kernel", "warp_tile", "m"),
         "warp_tile_n": _diagnostic_value(diagnostics, "kernel", "warp_tile", "n"),
         "warp_tile_k": _diagnostic_value(diagnostics, "kernel", "warp_tile", "k"),
+        "num_warp_tile_k": _diagnostic_value(
+            diagnostics, "kernel", "num_warp_tile_k"
+        ),
         "mma_shape_m": _diagnostic_value(diagnostics, "kernel", "mma_shape", "m"),
         "mma_shape_n": _diagnostic_value(diagnostics, "kernel", "mma_shape", "n"),
         "mma_shape_k": _diagnostic_value(diagnostics, "kernel", "mma_shape", "k"),
@@ -559,6 +1003,10 @@ def _performance_details_row(
         "shared_memory_bytes_per_cta": _diagnostic_value(
             diagnostics, "kernel", "shared_memory_bytes_per_cta"
         ),
+        "kernel_max_concurrent_ctas_per_sm": _diagnostic_value(
+            diagnostics, "kernel", "max_concurrent_ctas_per_sm"
+        ),
+        "slice_k": _diagnostic_value(diagnostics, "kernel", "slice_k"),
         "tile_strategy": _tile_strategy(diagnostics),
         "cta_grid_m": _diagnostic_value(diagnostics, "cta_grid", "m"),
         "cta_grid_n": _diagnostic_value(diagnostics, "cta_grid", "n"),
@@ -693,6 +1141,42 @@ def _performance_details_row(
         ),
         "roofline_bound_dram_flop_per_cycle": _diagnostic_value(
             diagnostics, "roofline_bounds_flop_per_cycle", "dram"
+        ),
+        "roofline_raw_bound_compute_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_raw_bounds_flop_per_cycle", "compute"
+        ),
+        "roofline_raw_bound_smem_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_raw_bounds_flop_per_cycle", "smem"
+        ),
+        "roofline_raw_bound_l2_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_raw_bounds_flop_per_cycle", "l2"
+        ),
+        "roofline_raw_bound_dram_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_raw_bounds_flop_per_cycle", "dram"
+        ),
+        "roofline_ceiling_utilization_compute_factor": _diagnostic_value(
+            diagnostics, "roofline_ceiling_utilization", "compute"
+        ),
+        "roofline_ceiling_utilization_smem_factor": _diagnostic_value(
+            diagnostics, "roofline_ceiling_utilization", "smem"
+        ),
+        "roofline_ceiling_utilization_l2_factor": _diagnostic_value(
+            diagnostics, "roofline_ceiling_utilization", "l2"
+        ),
+        "roofline_ceiling_utilization_dram_factor": _diagnostic_value(
+            diagnostics, "roofline_ceiling_utilization", "dram"
+        ),
+        "roofline_total_ceiling_utilization_compute_factor": _diagnostic_value(
+            diagnostics, "roofline_total_ceiling_utilization", "compute"
+        ),
+        "roofline_total_ceiling_utilization_smem_factor": _diagnostic_value(
+            diagnostics, "roofline_total_ceiling_utilization", "smem"
+        ),
+        "roofline_total_ceiling_utilization_l2_factor": _diagnostic_value(
+            diagnostics, "roofline_total_ceiling_utilization", "l2"
+        ),
+        "roofline_total_ceiling_utilization_dram_factor": _diagnostic_value(
+            diagnostics, "roofline_total_ceiling_utilization", "dram"
         ),
         "hbm_memory_latency_s": _diagnostic_value(
             diagnostics, "memory_level_latencies_s", "hbm"
@@ -869,6 +1353,53 @@ def _lower_or_none(value: str | None) -> str | None:
     if value is None or value == "":
         return None
     return value.strip().lower()
+
+
+def _tuple3_field(row: Mapping[str, Any], field: str) -> tuple[int, int, int] | None:
+    value = row.get(field)
+    if value is None or value == "":
+        return None
+    parsed = ast.literal_eval(value) if isinstance(value, str) else value
+    if not isinstance(parsed, (tuple, list)) or len(parsed) != 3:
+        return None
+    return (int(parsed[0]), int(parsed[1]), int(parsed[2]))
+
+
+def _bool_field(row: Mapping[str, Any], field: str, *, default: bool) -> bool:
+    value = row.get(field)
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "y"}:
+        return True
+    if normalized in {"false", "0", "no", "n"}:
+        return False
+    raise ValueError(f"{field} must be boolean")
+
+
+def _optional_positive_int_field(row: Mapping[str, Any], field: str) -> int | None:
+    value = row.get(field)
+    if value is None or value == "":
+        return None
+    numeric = float(str(value).replace(",", ""))
+    if not numeric.is_integer() or numeric <= 0:
+        return None
+    return int(numeric)
+
+
+def _parse_x_pair(value: str, *, transpose: bool = False) -> tuple[int, int]:
+    first, second = (int(item) for item in value.split("x", maxsplit=1))
+    return (second, first) if transpose else (first, second)
+
+
+def _factor_pairs(number: int) -> list[tuple[int, int]]:
+    factors: list[tuple[int, int]] = []
+    for candidate in range(1, int(number**0.5) + 1):
+        if number % candidate == 0:
+            factors.append((candidate, number // candidate))
+    return factors
 
 
 def _float_field(row: Mapping[str, str], field: str) -> float:
@@ -1891,8 +2422,14 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "static_energy_j",
     "flops",
     "predicted_elapsed_cycles",
+    "modeled_device_cycles",
+    "device_fixed_overhead_cycles",
+    "total_device_cycles",
+    "device_fixed_overhead_s",
+    "device_fixed_overhead_fraction",
     "clock_hz",
     "predicted_flop_per_cycle",
+    "modeled_flop_per_cycle",
     "predicted_tflops_per_s",
     "achieved_flops_per_s",
     "compute_latency_s",
@@ -1916,6 +2453,7 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "warp_tile_m",
     "warp_tile_n",
     "warp_tile_k",
+    "num_warp_tile_k",
     "mma_shape_m",
     "mma_shape_n",
     "mma_shape_k",
@@ -1924,6 +2462,8 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "threads_per_cta",
     "registers_per_thread",
     "shared_memory_bytes_per_cta",
+    "kernel_max_concurrent_ctas_per_sm",
+    "slice_k",
     "cta_grid_m",
     "cta_grid_n",
     "cta_grid_k_stages",
@@ -2000,6 +2540,18 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "roofline_bound_smem_flop_per_cycle",
     "roofline_bound_l2_flop_per_cycle",
     "roofline_bound_dram_flop_per_cycle",
+    "roofline_raw_bound_compute_flop_per_cycle",
+    "roofline_raw_bound_smem_flop_per_cycle",
+    "roofline_raw_bound_l2_flop_per_cycle",
+    "roofline_raw_bound_dram_flop_per_cycle",
+    "roofline_ceiling_utilization_compute_factor",
+    "roofline_ceiling_utilization_smem_factor",
+    "roofline_ceiling_utilization_l2_factor",
+    "roofline_ceiling_utilization_dram_factor",
+    "roofline_total_ceiling_utilization_compute_factor",
+    "roofline_total_ceiling_utilization_smem_factor",
+    "roofline_total_ceiling_utilization_l2_factor",
+    "roofline_total_ceiling_utilization_dram_factor",
     "hbm_memory_latency_s",
     "l2_memory_latency_s",
     "sram_memory_latency_s",

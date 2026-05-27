@@ -1,5 +1,7 @@
 name: a10
 kind: gpu
+# Minimum measured average power from EnergAIzer database/data a10_*freq900*.csv.
+static_power_w: 41.710332745228
 
 # Derived from EnergAIzer config/gpu/a10.yaml.
 # Peak FLOPs are scaled from sm_max_freq=1695 MHz to the measured LUT
@@ -7,6 +9,8 @@ kind: gpu
 # derived from power_cap divided by the corresponding peak throughput.
 compute:
   clock_hz: 9.0e8
+  # Calibrated from median small/small-skinny GEMM residuals at 900 MHz.
+  device_fixed_overhead_cycles: 15000
   num_sms: 72
   fma_dims: [16, 8, 16]
   dataflow: output_stationary
