@@ -86,6 +86,14 @@ class ArtifactAccuracyRow:
     predicted_energy_j: float
     energy_ratio: float
     energy_abs_pct_error: float
+    predicted_energy_e0_j: float | None = None
+    predicted_energy_e1_j: float | None = None
+    predicted_energy_e2_j: float | None = None
+    predicted_energy_e3_j: float | None = None
+    energy_abs_pct_error_e0: float | None = None
+    energy_abs_pct_error_e1: float | None = None
+    energy_abs_pct_error_e2: float | None = None
+    energy_abs_pct_error_e3: float | None = None
 
 
 @dataclass(frozen=True)
@@ -245,6 +253,14 @@ def read_csv_report(path: str | Path) -> ArtifactValidationReport:
                     predicted_energy_j=float(row["predicted_energy_j"]),
                     energy_ratio=float(row["energy_ratio"]),
                     energy_abs_pct_error=float(row["energy_abs_pct_error"]),
+                    predicted_energy_e0_j=_optional_float_csv(row, "predicted_energy_e0_j"),
+                    predicted_energy_e1_j=_optional_float_csv(row, "predicted_energy_e1_j"),
+                    predicted_energy_e2_j=_optional_float_csv(row, "predicted_energy_e2_j"),
+                    predicted_energy_e3_j=_optional_float_csv(row, "predicted_energy_e3_j"),
+                    energy_abs_pct_error_e0=_optional_float_csv(row, "energy_abs_pct_error_e0"),
+                    energy_abs_pct_error_e1=_optional_float_csv(row, "energy_abs_pct_error_e1"),
+                    energy_abs_pct_error_e2=_optional_float_csv(row, "energy_abs_pct_error_e2"),
+                    energy_abs_pct_error_e3=_optional_float_csv(row, "energy_abs_pct_error_e3"),
                 )
             )
     return ArtifactValidationReport(rows=tuple(rows), skip_counts={})
@@ -854,6 +870,7 @@ def _predict_sample(
     profile = model.predict(sample.op, hardware)
     predicted_latency_ms = profile.latency_s * 1000.0
     predicted_energy_j = profile.energy_j
+    energy_by_level = _energy_by_level(profile)
     latency_ratio = predicted_latency_ms / sample.measured_latency_ms
     energy_ratio = predicted_energy_j / sample.measured_energy_j
     accuracy_row = ArtifactAccuracyRow(
@@ -870,8 +887,44 @@ def _predict_sample(
         predicted_energy_j=predicted_energy_j,
         energy_ratio=energy_ratio,
         energy_abs_pct_error=abs(energy_ratio - 1.0) * 100.0,
+        predicted_energy_e0_j=energy_by_level.get("E0"),
+        predicted_energy_e1_j=energy_by_level.get("E1"),
+        predicted_energy_e2_j=energy_by_level.get("E2"),
+        predicted_energy_e3_j=energy_by_level.get("E3"),
+        energy_abs_pct_error_e0=_level_abs_pct_error(
+            energy_by_level.get("E0"),
+            sample.measured_energy_j,
+        ),
+        energy_abs_pct_error_e1=_level_abs_pct_error(
+            energy_by_level.get("E1"),
+            sample.measured_energy_j,
+        ),
+        energy_abs_pct_error_e2=_level_abs_pct_error(
+            energy_by_level.get("E2"),
+            sample.measured_energy_j,
+        ),
+        energy_abs_pct_error_e3=_level_abs_pct_error(
+            energy_by_level.get("E3"),
+            sample.measured_energy_j,
+        ),
     )
     return accuracy_row, _performance_details_row(sample, hardware, profile, accuracy_row)
+
+
+def _energy_by_level(profile: Any) -> dict[str, float]:
+    energy_model = profile.diagnostics.get("energy_model", {})
+    if not isinstance(energy_model, Mapping):
+        return {}
+    values = energy_model.get("energy_by_level_j", {})
+    if not isinstance(values, Mapping):
+        return {}
+    return {str(level): float(value) for level, value in values.items()}
+
+
+def _level_abs_pct_error(predicted: float | None, measured: float) -> float | None:
+    if predicted is None or measured <= 0.0:
+        return None
+    return abs(predicted / measured - 1.0) * 100.0
 
 
 def _performance_details_row(
@@ -903,6 +956,21 @@ def _performance_details_row(
     smem_read = _diagnostic_value(diagnostics, "transaction_bytes", "smem_read")
     smem_write = _diagnostic_value(diagnostics, "transaction_bytes", "smem_write")
     smem_total = _total_bytes(smem_read, smem_write)
+    energy_model = diagnostics.get("energy_model", {})
+    if not isinstance(energy_model, Mapping):
+        energy_model = {}
+    energy_levels = energy_model.get("energy_by_level_j", {})
+    if not isinstance(energy_levels, Mapping):
+        energy_levels = {}
+    energy_terms = energy_model.get("term_energy_j", {})
+    if not isinstance(energy_terms, Mapping):
+        energy_terms = {}
+    energy_features = energy_model.get("features", {})
+    if not isinstance(energy_features, Mapping):
+        energy_features = {}
+    power_coefficients = energy_model.get("power_coefficients", {})
+    if not isinstance(power_coefficients, Mapping):
+        power_coefficients = {}
 
     values: dict[str, Any] = {
         "source_file": accuracy_row.source_file,
@@ -930,6 +998,55 @@ def _performance_details_row(
         "measured_energy_j": accuracy_row.measured_energy_j,
         "predicted_energy_j": accuracy_row.predicted_energy_j,
         "energy_ratio": accuracy_row.energy_ratio,
+        "predicted_energy_e0_j": energy_levels.get("E0"),
+        "predicted_energy_e1_j": energy_levels.get("E1"),
+        "predicted_energy_e2_j": energy_levels.get("E2"),
+        "predicted_energy_e3_j": energy_levels.get("E3"),
+        "energy_abs_pct_error_e0": accuracy_row.energy_abs_pct_error_e0,
+        "energy_abs_pct_error_e1": accuracy_row.energy_abs_pct_error_e1,
+        "energy_abs_pct_error_e2": accuracy_row.energy_abs_pct_error_e2,
+        "energy_abs_pct_error_e3": accuracy_row.energy_abs_pct_error_e3,
+        "energy_model_level": energy_model.get("model_level"),
+        "energy_model_calibrated": energy_model.get("calibrated"),
+        "energy_model_fixed_event_energy_j": energy_model.get("fixed_event_energy_j"),
+        "energy_model_predicted_residual_energy_j": energy_model.get(
+            "predicted_residual_energy_j"
+        ),
+        "energy_model_baseline_j": energy_terms.get("baseline"),
+        "energy_model_residency_j": energy_terms.get("residency"),
+        "energy_model_active_state_j": energy_terms.get("active_state"),
+        "energy_model_tc_active_j": energy_terms.get("tc_active"),
+        "energy_model_dram_active_j": energy_terms.get("dram_active"),
+        "energy_model_l2_active_j": energy_terms.get("l2_active"),
+        "energy_model_smem_active_j": energy_terms.get("smem_active"),
+        "energy_model_time_kernel_s": energy_features.get("time_kernel_s"),
+        "energy_model_time_sm_resident_s": energy_features.get(
+            "time_sm_resident_s"
+        ),
+        "energy_model_time_tc_active_s": energy_features.get("time_tc_active_s"),
+        "energy_model_time_dram_active_s": energy_features.get(
+            "time_dram_active_s"
+        ),
+        "energy_model_time_l2_active_s": energy_features.get("time_l2_active_s"),
+        "energy_model_time_smem_active_s": energy_features.get(
+            "time_smem_active_s"
+        ),
+        "energy_model_base_power_w": power_coefficients.get("base_power_w"),
+        "energy_model_sm_resident_power_w": power_coefficients.get(
+            "sm_resident_power_w"
+        ),
+        "energy_model_tc_active_power_w": power_coefficients.get(
+            "tc_active_power_w"
+        ),
+        "energy_model_dram_active_power_w": power_coefficients.get(
+            "dram_active_power_w"
+        ),
+        "energy_model_l2_active_power_w": power_coefficients.get(
+            "l2_active_power_w"
+        ),
+        "energy_model_smem_active_power_w": power_coefficients.get(
+            "smem_active_power_w"
+        ),
         "compute_energy_j": profile.energy_breakdown.compute_j,
         "dram_energy_j": profile.energy_breakdown.hbm_j,
         "l2_energy_j": profile.energy_breakdown.l2_j,
@@ -957,7 +1074,6 @@ def _performance_details_row(
         "compute_latency_s": diagnostics.get("compute_latency_s"),
         "memory_latency_s": diagnostics.get("memory_latency_s"),
         "roofline_latency_s": diagnostics.get("roofline_latency_s"),
-        "kernel_launch_overhead_s": diagnostics.get("kernel_launch_overhead_s"),
         "effective_flops_per_s": diagnostics.get("effective_flops_per_s"),
         "effective_hbm_bandwidth_bytes_per_s": diagnostics.get(
             "effective_hbm_bandwidth_bytes_per_s"
@@ -1142,6 +1258,18 @@ def _performance_details_row(
         "roofline_bound_dram_flop_per_cycle": _diagnostic_value(
             diagnostics, "roofline_bounds_flop_per_cycle", "dram"
         ),
+        "roofline_effective_bound_deprecated_compute_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_effective_bounds_deprecated_flop_per_cycle", "compute"
+        ),
+        "roofline_effective_bound_deprecated_smem_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_effective_bounds_deprecated_flop_per_cycle", "smem"
+        ),
+        "roofline_effective_bound_deprecated_l2_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_effective_bounds_deprecated_flop_per_cycle", "l2"
+        ),
+        "roofline_effective_bound_deprecated_dram_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_effective_bounds_deprecated_flop_per_cycle", "dram"
+        ),
         "roofline_raw_bound_compute_flop_per_cycle": _diagnostic_value(
             diagnostics, "roofline_raw_bounds_flop_per_cycle", "compute"
         ),
@@ -1153,6 +1281,12 @@ def _performance_details_row(
         ),
         "roofline_raw_bound_dram_flop_per_cycle": _diagnostic_value(
             diagnostics, "roofline_raw_bounds_flop_per_cycle", "dram"
+        ),
+        "roofline_achieved_kernel_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_achieved_flop_per_cycle", "kernel_scope"
+        ),
+        "roofline_achieved_device_flop_per_cycle": _diagnostic_value(
+            diagnostics, "roofline_achieved_flop_per_cycle", "device_scope"
         ),
         "roofline_ceiling_utilization_compute_factor": _diagnostic_value(
             diagnostics, "roofline_ceiling_utilization", "compute"
@@ -1177,6 +1311,81 @@ def _performance_details_row(
         ),
         "roofline_total_ceiling_utilization_dram_factor": _diagnostic_value(
             diagnostics, "roofline_total_ceiling_utilization", "dram"
+        ),
+        "roofline_global_useful_flop_efficiency_factor": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "global",
+            "useful_flop_efficiency",
+        ),
+        "roofline_global_kernel_scope_efficiency_factor": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "global",
+            "kernel_scope_efficiency",
+        ),
+        "roofline_phase_prologue_fraction": _diagnostic_value(
+            diagnostics, "roofline_factor_breakdown", "phase", "prologue_fraction"
+        ),
+        "roofline_phase_work_fraction": _diagnostic_value(
+            diagnostics, "roofline_factor_breakdown", "phase", "work_fraction"
+        ),
+        "roofline_phase_epilogue_fraction": _diagnostic_value(
+            diagnostics, "roofline_factor_breakdown", "phase", "epilogue_fraction"
+        ),
+        "roofline_compute_active_fraction": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "compute",
+            "compute_active_fraction",
+        ),
+        "roofline_mma_dependency_fraction_of_math_group": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "compute",
+            "mma_dependency_fraction_of_math_group",
+        ),
+        "roofline_smem_active_fraction": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "smem",
+            "active_fraction_of_kernel",
+        ),
+        "roofline_l2_active_fraction": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "l2",
+            "active_fraction_of_kernel",
+        ),
+        "roofline_dram_active_fraction": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "dram",
+            "active_fraction_of_kernel",
+        ),
+        "roofline_l2_exposed_fraction": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "critical_path",
+            "exposed_l2_fraction",
+        ),
+        "roofline_dram_exposed_fraction": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "critical_path",
+            "exposed_dram_fraction",
+        ),
+        "roofline_attribution_primary": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "bottleneck_classification",
+            "primary",
+        ),
+        "roofline_attribution_secondary": _diagnostic_value(
+            diagnostics,
+            "roofline_factor_breakdown",
+            "bottleneck_classification",
+            "secondary",
         ),
         "hbm_memory_latency_s": _diagnostic_value(
             diagnostics, "memory_level_latencies_s", "hbm"
@@ -2309,6 +2518,13 @@ def _float_or_zero(value: Any) -> float:
     return float(value)
 
 
+def _optional_float_csv(row: Mapping[str, str], field: str) -> float | None:
+    value = row.get(field)
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
 def _short_hardware_label(hardware: str) -> str:
     if hardware == "a100_40gb_pcie":
         return "a100"
@@ -2387,6 +2603,14 @@ _CSV_FIELDS = (
     "predicted_energy_j",
     "energy_ratio",
     "energy_abs_pct_error",
+    "predicted_energy_e0_j",
+    "predicted_energy_e1_j",
+    "predicted_energy_e2_j",
+    "predicted_energy_e3_j",
+    "energy_abs_pct_error_e0",
+    "energy_abs_pct_error_e1",
+    "energy_abs_pct_error_e2",
+    "energy_abs_pct_error_e3",
 )
 
 
@@ -2414,6 +2638,37 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "measured_energy_j",
     "predicted_energy_j",
     "energy_ratio",
+    "predicted_energy_e0_j",
+    "predicted_energy_e1_j",
+    "predicted_energy_e2_j",
+    "predicted_energy_e3_j",
+    "energy_abs_pct_error_e0",
+    "energy_abs_pct_error_e1",
+    "energy_abs_pct_error_e2",
+    "energy_abs_pct_error_e3",
+    "energy_model_level",
+    "energy_model_calibrated",
+    "energy_model_fixed_event_energy_j",
+    "energy_model_predicted_residual_energy_j",
+    "energy_model_baseline_j",
+    "energy_model_residency_j",
+    "energy_model_active_state_j",
+    "energy_model_tc_active_j",
+    "energy_model_dram_active_j",
+    "energy_model_l2_active_j",
+    "energy_model_smem_active_j",
+    "energy_model_time_kernel_s",
+    "energy_model_time_sm_resident_s",
+    "energy_model_time_tc_active_s",
+    "energy_model_time_dram_active_s",
+    "energy_model_time_l2_active_s",
+    "energy_model_time_smem_active_s",
+    "energy_model_base_power_w",
+    "energy_model_sm_resident_power_w",
+    "energy_model_tc_active_power_w",
+    "energy_model_dram_active_power_w",
+    "energy_model_l2_active_power_w",
+    "energy_model_smem_active_power_w",
     "compute_energy_j",
     "dram_energy_j",
     "l2_energy_j",
@@ -2435,7 +2690,6 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "compute_latency_s",
     "memory_latency_s",
     "roofline_latency_s",
-    "kernel_launch_overhead_s",
     "effective_flops_per_s",
     "effective_hbm_bandwidth_bytes_per_s",
     "arithmetic_intensity_flops_per_byte",
@@ -2540,10 +2794,16 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "roofline_bound_smem_flop_per_cycle",
     "roofline_bound_l2_flop_per_cycle",
     "roofline_bound_dram_flop_per_cycle",
+    "roofline_effective_bound_deprecated_compute_flop_per_cycle",
+    "roofline_effective_bound_deprecated_smem_flop_per_cycle",
+    "roofline_effective_bound_deprecated_l2_flop_per_cycle",
+    "roofline_effective_bound_deprecated_dram_flop_per_cycle",
     "roofline_raw_bound_compute_flop_per_cycle",
     "roofline_raw_bound_smem_flop_per_cycle",
     "roofline_raw_bound_l2_flop_per_cycle",
     "roofline_raw_bound_dram_flop_per_cycle",
+    "roofline_achieved_kernel_flop_per_cycle",
+    "roofline_achieved_device_flop_per_cycle",
     "roofline_ceiling_utilization_compute_factor",
     "roofline_ceiling_utilization_smem_factor",
     "roofline_ceiling_utilization_l2_factor",
@@ -2552,6 +2812,20 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "roofline_total_ceiling_utilization_smem_factor",
     "roofline_total_ceiling_utilization_l2_factor",
     "roofline_total_ceiling_utilization_dram_factor",
+    "roofline_global_useful_flop_efficiency_factor",
+    "roofline_global_kernel_scope_efficiency_factor",
+    "roofline_phase_prologue_fraction",
+    "roofline_phase_work_fraction",
+    "roofline_phase_epilogue_fraction",
+    "roofline_compute_active_fraction",
+    "roofline_mma_dependency_fraction_of_math_group",
+    "roofline_smem_active_fraction",
+    "roofline_l2_active_fraction",
+    "roofline_dram_active_fraction",
+    "roofline_l2_exposed_fraction",
+    "roofline_dram_exposed_fraction",
+    "roofline_attribution_primary",
+    "roofline_attribution_secondary",
     "hbm_memory_latency_s",
     "l2_memory_latency_s",
     "sram_memory_latency_s",

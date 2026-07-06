@@ -9,6 +9,11 @@ from typing import Any, Mapping
 import yaml
 
 from opmodel.api import DType, LocalOp, OpKind, OpProfile, Phase, TensorRole, TensorSpec
+from opmodel.calibration import (
+    calibrate_energy_from_artifact_database,
+    format_calibration_report,
+    write_calibrated_hardware_config,
+)
 from opmodel.hardware import load_hardware
 from opmodel.registry import create_model
 from opmodel.validation.artifact_accuracy import (
@@ -46,6 +51,14 @@ def main(argv: list[str] | None = None) -> int:
         help="fixed y-axis maximum for generated workload bar plots",
     )
 
+    calibrate_parser = subparsers.add_parser("calibrate-energy")
+    calibrate_parser.add_argument("--data-dir", default=str(DEFAULT_ARTIFACT_DATA_DIR))
+    calibrate_parser.add_argument("--hardware-dir", default=str(DEFAULT_HARDWARE_DIR))
+    calibrate_parser.add_argument("--hardware", required=True)
+    calibrate_parser.add_argument("--fit-fraction", type=float, default=0.7)
+    calibrate_parser.add_argument("--limit", type=int, help="maximum GEMM rows to use")
+    calibrate_parser.add_argument("--output-hardware", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "predict":
         hardware = load_hardware(args.hardware)
@@ -79,6 +92,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Wrote performance details CSV report: {args.output_details_csv}")
         for plot_path in plot_paths:
             print(f"Wrote normalized plot: {plot_path}")
+        return 0
+    if args.command == "calibrate-energy":
+        result = calibrate_energy_from_artifact_database(
+            hardware_name=args.hardware,
+            data_dir=args.data_dir,
+            hardware_dir=args.hardware_dir,
+            fit_fraction=args.fit_fraction,
+            limit=args.limit,
+        )
+        write_calibrated_hardware_config(
+            input_hardware_path=result.input_hardware_path,
+            output_hardware_path=args.output_hardware,
+            energy_model=result.energy_model,
+        )
+        print(format_calibration_report(result))
+        print(f"Wrote calibrated hardware config: {args.output_hardware}")
         return 0
     raise AssertionError(f"Unhandled command: {args.command}")
 

@@ -17,7 +17,7 @@ attrs:
   warps_per_cta: 4
   threads_per_cta: 128
   registers_per_thread: 64
-  beta_zero: true
+  beta_zero: truLooke
 tensors:
   - role: input
     shape: [4096, 8192]

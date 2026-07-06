@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from opmodel.api import DType, EngineKind, LocalOp, MemoryAccess, OpKind, OpProfile, TensorRole
+from opmodel.energy import apply_calibrated_energy_model
 from opmodel.estimator import DispatchingOpModel
 from opmodel.hardware import HardwareSpec, MemoryLevel
 from opmodel.models.roofline import (
@@ -80,9 +81,38 @@ class GemmKernelSpec:
     warps_per_cta: int
     threads_per_cta: int
     registers_per_thread: int
-    shared_memory_bytes_per_cta: int | None
     max_concurrent_ctas_per_sm: int | None
     slice_k: bool
+
+
+@dataclass(frozen=True)
+class GemmKernelTemplate:
+    name: str
+    cta_m: int
+    cta_n: int
+    cta_k: int
+    warp_m: int
+    warp_n: int
+    warp_k: int
+    num_warp_tile_k: int
+    mma_m: int
+    mma_n: int
+    mma_k: int
+    pipeline_stages: int
+    warps_per_cta: int
+    registers_per_thread: int
+    source: str
+    dtypes: tuple[DType, ...]
+
+
+@dataclass(frozen=True)
+class GemmCandidateEvaluation:
+    template: GemmKernelTemplate
+    kernel: GemmKernelSpec
+    profile: OpProfile
+    selection_energy_j: float
+    cheap_rank: int
+    cheap_score: float
 
 
 @dataclass(frozen=True)
@@ -216,6 +246,308 @@ class TimelineResult:
     compute_dram_overlap: float
 
 
+_GEMM_SELECTION_OBJECTIVES = frozenset(("latency", "energy"))
+_GEMM_SELECTION_BACKENDS = frozenset(("extended_roofline",))
+_DEFAULT_GEMM_SELECTION_SHORTLIST_SIZE = 12
+_EXPLICIT_KERNEL_ATTRS = frozenset(
+    (
+        "cta_tile_m",
+        "cta_tile_n",
+        "cta_tile_k",
+        "warp_tile_m",
+        "warp_tile_n",
+        "warp_tile_k",
+        "num_warp_tile_k",
+        "num_warp_tile_K",
+        "mma_m",
+        "mma_n",
+        "mma_k",
+        "pipeline_stages",
+        "warps_per_cta",
+        "threads_per_cta",
+        "registers_per_thread",
+        "resident_ctas_per_sm",
+        "max_concurrent_block",
+        "slice_k",
+        "sliceK",
+    )
+)
+
+_BF16_FP16_DTYPES = (DType.BF16, DType.FP16)
+_GPU_GEMM_KERNEL_CATALOG = (
+    GemmKernelTemplate(
+        "sm80_256x128x32_64x64x32_8w3s",
+        256,
+        128,
+        32,
+        64,
+        64,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        8,
+        96,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_128x256x32_64x64x32_8w3s",
+        128,
+        256,
+        32,
+        64,
+        64,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        8,
+        96,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_128x128x32_64x64x32_4w3s",
+        128,
+        128,
+        32,
+        64,
+        64,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        4,
+        64,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_128x64x32_64x32x32_4w3s",
+        128,
+        64,
+        32,
+        64,
+        32,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        4,
+        64,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_64x128x32_32x64x32_4w3s",
+        64,
+        128,
+        32,
+        32,
+        64,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        4,
+        64,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_64x64x32_32x32x32_4w3s",
+        64,
+        64,
+        32,
+        32,
+        32,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        4,
+        64,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_256x64x32_64x32x32_8w3s",
+        256,
+        64,
+        32,
+        64,
+        32,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        8,
+        96,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_64x256x32_32x64x32_8w3s",
+        64,
+        256,
+        32,
+        32,
+        64,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        8,
+        96,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_128x32x32_64x32x32_2w3s",
+        128,
+        32,
+        32,
+        64,
+        32,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        2,
+        48,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_32x128x32_32x64x32_2w3s",
+        32,
+        128,
+        32,
+        32,
+        64,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        2,
+        48,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_64x32x32_32x32x32_2w3s",
+        64,
+        32,
+        32,
+        32,
+        32,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        2,
+        48,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_32x64x32_32x32x32_2w3s",
+        32,
+        64,
+        32,
+        32,
+        32,
+        32,
+        1,
+        16,
+        8,
+        16,
+        3,
+        2,
+        48,
+        "cuda_sm80_catalog",
+        _BF16_FP16_DTYPES,
+    ),
+    GemmKernelTemplate(
+        "sm80_tf32_128x128x16_64x64x16_4w3s",
+        128,
+        128,
+        16,
+        64,
+        64,
+        16,
+        1,
+        16,
+        8,
+        8,
+        3,
+        4,
+        64,
+        "cuda_sm80_catalog",
+        (DType.TF32,),
+    ),
+    GemmKernelTemplate(
+        "sm80_tf32_64x128x16_32x64x16_4w3s",
+        64,
+        128,
+        16,
+        32,
+        64,
+        16,
+        1,
+        16,
+        8,
+        8,
+        3,
+        4,
+        64,
+        "cuda_sm80_catalog",
+        (DType.TF32,),
+    ),
+    GemmKernelTemplate(
+        "sm80_tf32_128x64x16_64x32x16_4w3s",
+        128,
+        64,
+        16,
+        64,
+        32,
+        16,
+        1,
+        16,
+        8,
+        8,
+        3,
+        4,
+        64,
+        "cuda_sm80_catalog",
+        (DType.TF32,),
+    ),
+)
+
+
 class ExtendedGemmEstimator:
     def __init__(self, *, batched: bool) -> None:
         self._batched = batched
@@ -237,67 +569,485 @@ class ExtendedGemmEstimator:
                 diagnostics={"tensor_fallback": engine.value},
             )
 
+        if _should_select_gemm_kernel(op.attrs, hardware):
+            return _estimate_selected_gemm_kernel(
+                op=op,
+                problem=problem,
+                footprint=footprint,
+                hardware=hardware,
+                batched=self._batched,
+            )
+
         warnings: list[str] = []
-        kernel = _kernel_spec(op.attrs, problem.input_dtype, hardware, warnings)
-        clock_hz = _clock_hz(hardware, warnings)
-        grid = _grid_accounting(problem, kernel)
-        traffic = _traffic_accounting(problem, kernel, grid, hardware, warnings)
-        occupancy = _occupancy(kernel, grid, hardware, warnings)
-        timeline = _timeline(problem, kernel, grid, traffic, occupancy, hardware, clock_hz, warnings)
-        fixed_overhead_cycles = float(hardware.compute.device_fixed_overhead_cycles or 0)
-        total_device_cycles = timeline.kernel_cycles + fixed_overhead_cycles
-        bottlenecks = _classify_bottlenecks(
-            problem,
-            grid,
-            traffic,
-            occupancy,
-            timeline,
-            hardware,
-            clock_hz,
-            fixed_overhead_cycles,
-        )
-
-        latency_s = hardware.kernel_launch_overhead_s + total_device_cycles / clock_hz
-        flops_per_cycle = (
-            grid.useful_flops / total_device_cycles if total_device_cycles else 0.0
-        )
-        tflops_per_s = (grid.useful_flops / latency_s / 1.0e12) if latency_s else 0.0
-        energy_breakdown = estimate_energy(
-            flops=grid.useful_flops,
-            memory_access=traffic.memory_access,
-            engine=EngineKind.TENSOR,
-            dtype=problem.input_dtype,
-            hardware=hardware,
-            latency_s=latency_s,
-        )
-
-        diagnostics = _diagnostics(
+        kernel = _kernel_spec(op.attrs, hardware, warnings)
+        return _estimate_gemm_with_kernel(
             problem=problem,
-            kernel=kernel,
-            grid=grid,
-            traffic=traffic,
-            occupancy=occupancy,
-            timeline=timeline,
-            bottlenecks=bottlenecks,
-            warnings=tuple(warnings),
-            clock_hz=clock_hz,
-            latency_s=latency_s,
-            flops_per_cycle=flops_per_cycle,
-            tflops_per_s=tflops_per_s,
-            hardware=hardware,
-            fixed_overhead_cycles=fixed_overhead_cycles,
-        )
-        return OpProfile(
-            latency_s=latency_s,
-            energy_j=energy_breakdown.total_j,
-            flops=grid.useful_flops,
-            engine=EngineKind.TENSOR,
             footprint=footprint,
-            memory_access=traffic.memory_access,
-            energy_breakdown=energy_breakdown,
-            implementation=_implementation_name(self._batched),
-            diagnostics=diagnostics,
+            kernel=kernel,
+            hardware=hardware,
+            batched=self._batched,
+            warnings=warnings,
         )
+
+
+def _estimate_gemm_with_kernel(
+    *,
+    problem: GemmProblemSpec,
+    footprint,
+    kernel: GemmKernelSpec,
+    hardware: HardwareSpec,
+    batched: bool,
+    warnings: list[str],
+) -> OpProfile:
+    clock_hz = _clock_hz(hardware, warnings)
+    grid = _grid_accounting(problem, kernel)
+    traffic = _traffic_accounting(problem, kernel, grid, hardware, warnings)
+    occupancy = _occupancy(problem, kernel, grid, hardware, warnings)
+    timeline = _timeline(problem, kernel, grid, traffic, occupancy, hardware, clock_hz, warnings)
+    fixed_overhead_cycles = float(hardware.compute.device_fixed_overhead_cycles or 0)
+    total_device_cycles = timeline.kernel_cycles + fixed_overhead_cycles
+    bottlenecks = _classify_bottlenecks(
+        problem,
+        grid,
+        traffic,
+        occupancy,
+        timeline,
+        hardware,
+        clock_hz,
+        fixed_overhead_cycles,
+    )
+
+    latency_s = total_device_cycles / clock_hz
+    flops_per_cycle = (
+        grid.useful_flops / total_device_cycles if total_device_cycles else 0.0
+    )
+    tflops_per_s = (grid.useful_flops / latency_s / 1.0e12) if latency_s else 0.0
+    energy_breakdown = estimate_energy(
+        flops=grid.useful_flops,
+        memory_access=traffic.memory_access,
+        engine=EngineKind.TENSOR,
+        dtype=problem.input_dtype,
+        hardware=hardware,
+        latency_s=latency_s,
+    )
+
+    diagnostics = _diagnostics(
+        problem=problem,
+        kernel=kernel,
+        grid=grid,
+        traffic=traffic,
+        occupancy=occupancy,
+        timeline=timeline,
+        bottlenecks=bottlenecks,
+        warnings=tuple(warnings),
+        clock_hz=clock_hz,
+        latency_s=latency_s,
+        flops_per_cycle=flops_per_cycle,
+        tflops_per_s=tflops_per_s,
+        hardware=hardware,
+        fixed_overhead_cycles=fixed_overhead_cycles,
+    )
+    profile = OpProfile(
+        latency_s=latency_s,
+        energy_j=energy_breakdown.total_j,
+        flops=grid.useful_flops,
+        engine=EngineKind.TENSOR,
+        footprint=footprint,
+        memory_access=traffic.memory_access,
+        energy_breakdown=energy_breakdown,
+        implementation=_implementation_name(batched),
+        diagnostics=diagnostics,
+    )
+    return apply_calibrated_energy_model(profile, hardware)
+
+
+def evaluate_gemm_template_candidates(
+    op: LocalOp,
+    hardware: HardwareSpec,
+    *,
+    shortlist_size: int | None = None,
+) -> tuple[GemmCandidateEvaluation, ...]:
+    if op.kind not in (OpKind.GEMM, OpKind.BATCHED_GEMM):
+        raise ValueError("GEMM template candidates require a GEMM op")
+    problem = _problem_spec(op, batched=op.kind == OpKind.BATCHED_GEMM)
+    engine = _matmul_engine(problem.input_dtype, hardware)
+    if engine != EngineKind.TENSOR or hardware.kind != "gpu":
+        return ()
+    backend = _selection_backend(op.attrs)
+    size = (
+        _positive_int_value(shortlist_size, "shortlist_size")
+        if shortlist_size is not None
+        else _selection_shortlist_size(op.attrs)
+    )
+    return _evaluate_gemm_template_candidates(
+        problem=problem,
+        footprint=footprint_from_tensors(op),
+        hardware=hardware,
+        batched=op.kind == OpKind.BATCHED_GEMM,
+        objective=_selection_objective(op.attrs),
+        backend=backend,
+        shortlist_size=size,
+    )
+
+
+def select_gemm_template_candidate(
+    candidates: tuple[GemmCandidateEvaluation, ...],
+    *,
+    objective: str = "latency",
+) -> GemmCandidateEvaluation:
+    objective = _validate_selection_objective(objective)
+    if not candidates:
+        raise ValueError("No GEMM template candidates to select from")
+    return min(candidates, key=lambda candidate: _candidate_objective_key(candidate, objective))
+
+
+def _estimate_selected_gemm_kernel(
+    *,
+    op: LocalOp,
+    problem: GemmProblemSpec,
+    footprint,
+    hardware: HardwareSpec,
+    batched: bool,
+) -> OpProfile:
+    objective = _selection_objective(op.attrs)
+    backend = _selection_backend(op.attrs)
+    shortlist_size = _selection_shortlist_size(op.attrs)
+    candidates = _evaluate_gemm_template_candidates(
+        problem=problem,
+        footprint=footprint,
+        hardware=hardware,
+        batched=batched,
+        objective=objective,
+        backend=backend,
+        shortlist_size=shortlist_size,
+    )
+    if not candidates:
+        warnings = ["gemm_selection_no_legal_catalog_template"]
+        kernel = _kernel_spec(op.attrs, hardware, warnings)
+        profile = _estimate_gemm_with_kernel(
+            problem=problem,
+            footprint=footprint,
+            kernel=kernel,
+            hardware=hardware,
+            batched=batched,
+            warnings=warnings,
+        )
+        return _with_gemm_selection_diagnostics(
+            profile,
+            {
+                "enabled": False,
+                "reason": "no_legal_catalog_template",
+                "objective": objective,
+                "backend": backend,
+                "catalog_size": len(_kernel_template_catalog(problem.input_dtype, hardware)),
+                "legal_candidates": 0,
+                "shortlist_size": 0,
+            },
+        )
+
+    selected = select_gemm_template_candidate(candidates, objective=objective)
+    return _with_gemm_selection_diagnostics(
+        selected.profile,
+        _gemm_selection_metadata(
+            selected=selected,
+            candidates=candidates,
+            objective=objective,
+            backend=backend,
+            catalog_size=len(_kernel_template_catalog(problem.input_dtype, hardware)),
+            legal_count=len(_legal_kernel_templates(problem, hardware)),
+        ),
+    )
+
+
+def _evaluate_gemm_template_candidates(
+    *,
+    problem: GemmProblemSpec,
+    footprint,
+    hardware: HardwareSpec,
+    batched: bool,
+    objective: str,
+    backend: str,
+    shortlist_size: int,
+) -> tuple[GemmCandidateEvaluation, ...]:
+    if backend != "extended_roofline":
+        raise ValueError(f"Unsupported GEMM selection backend: {backend}")
+    legal = _legal_kernel_templates(problem, hardware)
+    ranked = sorted(
+        legal,
+        key=lambda template: _cheap_template_score(template, problem, hardware, objective),
+    )
+    evaluations: list[GemmCandidateEvaluation] = []
+    for rank, template in enumerate(ranked[:shortlist_size], start=1):
+        kernel = _kernel_from_template(template)
+        profile = _estimate_gemm_with_kernel(
+            problem=problem,
+            footprint=footprint,
+            kernel=kernel,
+            hardware=hardware,
+            batched=batched,
+            warnings=[],
+        )
+        evaluations.append(
+            GemmCandidateEvaluation(
+                template=template,
+                kernel=kernel,
+                profile=profile,
+                selection_energy_j=_selection_energy_j(profile, problem, hardware),
+                cheap_rank=rank,
+                cheap_score=_cheap_template_score(template, problem, hardware, objective),
+            )
+        )
+    return tuple(evaluations)
+
+
+def _should_select_gemm_kernel(attrs: Mapping[str, Any], hardware: HardwareSpec) -> bool:
+    if hardware.kind != "gpu":
+        return False
+    return not any(name in attrs for name in _EXPLICIT_KERNEL_ATTRS)
+
+
+def _selection_objective(attrs: Mapping[str, Any]) -> str:
+    return _validate_selection_objective(str(attrs.get("gemm_selection_objective", "latency")))
+
+
+def _validate_selection_objective(value: str) -> str:
+    if value not in _GEMM_SELECTION_OBJECTIVES:
+        raise ValueError(
+            "gemm_selection_objective must be one of: "
+            + ", ".join(sorted(_GEMM_SELECTION_OBJECTIVES))
+        )
+    return value
+
+
+def _selection_backend(attrs: Mapping[str, Any]) -> str:
+    backend = str(attrs.get("gemm_selection_backend", "extended_roofline"))
+    if backend not in _GEMM_SELECTION_BACKENDS:
+        raise ValueError(
+            "gemm_selection_backend must be one of: "
+            + ", ".join(sorted(_GEMM_SELECTION_BACKENDS))
+        )
+    return backend
+
+
+def _selection_shortlist_size(attrs: Mapping[str, Any]) -> int:
+    return _positive_int_value(
+        attrs.get("gemm_selection_shortlist_size", _DEFAULT_GEMM_SELECTION_SHORTLIST_SIZE),
+        "gemm_selection_shortlist_size",
+    )
+
+
+def _positive_int_value(value: Any, name: str) -> int:
+    result = int(value)
+    if result <= 0:
+        raise ValueError(f"{name} must be positive")
+    return result
+
+
+def _kernel_template_catalog(
+    dtype: DType, hardware: HardwareSpec
+) -> tuple[GemmKernelTemplate, ...]:
+    if hardware.kind != "gpu":
+        return ()
+    return tuple(
+        template for template in _GPU_GEMM_KERNEL_CATALOG if dtype in template.dtypes
+    )
+
+
+def _legal_kernel_templates(
+    problem: GemmProblemSpec, hardware: HardwareSpec
+) -> tuple[GemmKernelTemplate, ...]:
+    return tuple(
+        template
+        for template in _kernel_template_catalog(problem.input_dtype, hardware)
+        if _template_is_legal(template, problem, hardware)
+    )
+
+
+def _template_is_legal(
+    template: GemmKernelTemplate,
+    problem: GemmProblemSpec,
+    hardware: HardwareSpec,
+) -> bool:
+    if problem.input_dtype not in hardware.compute.tensor_flops_per_s:
+        return False
+    if not _divisible(template.cta_m, template.mma_m):
+        return False
+    if not _divisible(template.cta_n, template.mma_n):
+        return False
+    if not _divisible(template.cta_k, template.mma_k):
+        return False
+    if not _divisible(template.warp_m, template.mma_m):
+        return False
+    if not _divisible(template.warp_n, template.mma_n):
+        return False
+    if not _divisible(template.warp_k, template.mma_k):
+        return False
+    if not _divisible(template.cta_m, template.warp_m):
+        return False
+    if not _divisible(template.cta_n, template.warp_n):
+        return False
+    if not _divisible(template.cta_k, template.warp_k):
+        return False
+    spatial_warps = (template.cta_m // template.warp_m) * (
+        template.cta_n // template.warp_n
+    )
+    if spatial_warps != template.warps_per_cta:
+        return False
+    threads_per_cta = template.warps_per_cta * 32
+    if hardware.compute.max_warps_per_sm is not None:
+        if template.warps_per_cta > hardware.compute.max_warps_per_sm:
+            return False
+    if hardware.compute.registers_per_sm is not None:
+        registers_per_cta = template.registers_per_thread * threads_per_cta
+        if registers_per_cta > hardware.compute.registers_per_sm:
+            return False
+    if hardware.compute.shared_memory_bytes_per_sm is not None:
+        kernel = _kernel_from_template(template)
+        grid = _grid_accounting(problem, kernel)
+        if _shared_memory_bytes_per_cta(problem, kernel, grid) > hardware.compute.shared_memory_bytes_per_sm:
+            return False
+    if hardware.compute.max_ctas_per_sm is not None and hardware.compute.max_ctas_per_sm <= 0:
+        return False
+    return True
+
+
+def _cheap_template_score(
+    template: GemmKernelTemplate,
+    problem: GemmProblemSpec,
+    hardware: HardwareSpec,
+    objective: str,
+) -> float:
+    kernel = _kernel_from_template(template)
+    grid = _grid_accounting(problem, kernel)
+    occupancy = _occupancy(problem, kernel, grid, hardware, [])
+    problem_aspect = problem.m / max(problem.n, 1)
+    tile_aspect = template.cta_m / max(template.cta_n, 1)
+    aspect_penalty = abs(math.log2(problem_aspect / tile_aspect))
+    wave_penalty = 1.0 - occupancy.tail_efficiency
+    underfill_penalty = max(0, occupancy.ctas_per_wave - grid.cta_count) / max(
+        occupancy.ctas_per_wave, 1
+    )
+    k_penalty = 0.2 if problem.k < template.cta_k else 0.0
+    tile_efficiency_penalty = 1.0 - grid.tile_efficiency
+    objective_penalty = 0.0
+    if objective == "energy":
+        smem_bytes = _shared_memory_bytes_per_cta(problem, kernel, grid)
+        objective_penalty = smem_bytes / max(1, template.pipeline_stages) / 131072.0
+    return (
+        4.0 * tile_efficiency_penalty
+        + 1.2 * underfill_penalty
+        + 0.7 * wave_penalty
+        + 0.35 * aspect_penalty
+        + k_penalty
+        + 0.2 * objective_penalty
+    )
+
+
+def _kernel_from_template(template: GemmKernelTemplate) -> GemmKernelSpec:
+    return GemmKernelSpec(
+        cta_m=template.cta_m,
+        cta_n=template.cta_n,
+        cta_k=template.cta_k,
+        warp_m=template.warp_m,
+        warp_n=template.warp_n,
+        warp_k=template.warp_k,
+        num_warp_tile_k=template.num_warp_tile_k,
+        mma_m=template.mma_m,
+        mma_n=template.mma_n,
+        mma_k=template.mma_k,
+        pipeline_stages=template.pipeline_stages,
+        warps_per_cta=template.warps_per_cta,
+        threads_per_cta=template.warps_per_cta * 32,
+        registers_per_thread=template.registers_per_thread,
+        max_concurrent_ctas_per_sm=None,
+        slice_k=False,
+    )
+
+
+def _selection_energy_j(
+    profile: OpProfile, problem: GemmProblemSpec, hardware: HardwareSpec
+) -> float:
+    issued_flops = float(profile.diagnostics.get("issued_flops", profile.flops))
+    extra_flops = max(0.0, issued_flops - profile.flops)
+    return profile.energy_j + extra_flops * hardware.compute.tensor_energy_j_per_flop.get(
+        problem.input_dtype, 0.0
+    )
+
+
+def _candidate_objective_key(
+    candidate: GemmCandidateEvaluation, objective: str
+) -> tuple[float, float, float, int]:
+    tile_efficiency = float(candidate.profile.diagnostics.get("tile_efficiency", 0.0))
+    if objective == "energy":
+        return (
+            candidate.selection_energy_j,
+            candidate.profile.latency_s,
+            -tile_efficiency,
+            candidate.cheap_rank,
+        )
+    return (
+        candidate.profile.latency_s,
+        candidate.selection_energy_j,
+        -tile_efficiency,
+        candidate.cheap_rank,
+    )
+
+
+def _with_gemm_selection_diagnostics(
+    profile: OpProfile, metadata: Mapping[str, Any]
+) -> OpProfile:
+    diagnostics = dict(profile.diagnostics)
+    diagnostics["gemm_selection"] = dict(metadata)
+    return replace(profile, diagnostics=diagnostics)
+
+
+def _gemm_selection_metadata(
+    *,
+    selected: GemmCandidateEvaluation,
+    candidates: tuple[GemmCandidateEvaluation, ...],
+    objective: str,
+    backend: str,
+    catalog_size: int,
+    legal_count: int,
+) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "objective": objective,
+        "backend": backend,
+        "catalog_size": catalog_size,
+        "legal_candidates": legal_count,
+        "shortlist_size": len(candidates),
+        "selected_template": _template_diagnostics(selected.template),
+        "selected_rank": selected.cheap_rank,
+        "selected_latency_s": selected.profile.latency_s,
+        "selected_energy_j": selected.profile.energy_j,
+        "selection_energy_j": selected.selection_energy_j,
+        "cheap_score": selected.cheap_score,
+    }
+
+
+def _template_diagnostics(template: GemmKernelTemplate) -> dict[str, Any]:
+    return {
+        "name": template.name,
+        "source": template.source,
+        "cta_tile": {"m": template.cta_m, "n": template.cta_n, "k": template.cta_k},
+        "warp_tile": {
+            "m": template.warp_m,
+            "n": template.warp_n,
+            "k": template.warp_k,
+        },
+        "num_warp_tile_k": template.num_warp_tile_k,
+        "mma_shape": {"m": template.mma_m, "n": template.mma_n, "k": template.mma_k},
+        "pipeline_stages": template.pipeline_stages,
+        "warps_per_cta": template.warps_per_cta,
+        "threads_per_cta": template.warps_per_cta * 32,
+        "registers_per_thread": template.registers_per_thread,
+        "dtypes": tuple(dtype.value for dtype in template.dtypes),
+    }
+
+
+def _divisible(numerator: int, denominator: int) -> bool:
+    return denominator > 0 and numerator % denominator == 0
 
 
 def _problem_spec(op: LocalOp, *, batched: bool) -> GemmProblemSpec:
@@ -331,7 +1081,6 @@ def _problem_spec(op: LocalOp, *, batched: bool) -> GemmProblemSpec:
 
 def _kernel_spec(
     attrs: Mapping[str, Any],
-    dtype: DType,
     hardware: HardwareSpec,
     warnings: list[str],
 ) -> GemmKernelSpec:
@@ -358,13 +1107,6 @@ def _kernel_spec(
     warps_per_cta = _positive_int_attr(attrs, "warps_per_cta", 4)
     threads_per_cta = _positive_int_attr(attrs, "threads_per_cta", warps_per_cta * 32)
     registers_per_thread = _positive_int_attr(attrs, "registers_per_thread", 64)
-    shared_memory_bytes_per_cta = _optional_positive_int_attr(attrs, "shared_memory_bytes_per_cta")
-    if shared_memory_bytes_per_cta is None:
-        stage_operand_bytes = _ceil_scalar_bytes(
-            (cta_m * cta_k + cta_k * cta_n) * dtype_nbytes(dtype)
-        )
-        shared_memory_bytes_per_cta = stage_operand_bytes * pipeline_stages
-        warnings.append("shared_memory_bytes_per_cta_estimated")
     max_concurrent_ctas_per_sm = _optional_positive_int_attr(
         attrs, "resident_ctas_per_sm"
     )
@@ -387,7 +1129,6 @@ def _kernel_spec(
         warps_per_cta=warps_per_cta,
         threads_per_cta=threads_per_cta,
         registers_per_thread=registers_per_thread,
-        shared_memory_bytes_per_cta=shared_memory_bytes_per_cta,
         max_concurrent_ctas_per_sm=max_concurrent_ctas_per_sm,
         slice_k=bool(attrs.get("slice_k", attrs.get("sliceK", False))),
     )
@@ -417,6 +1158,37 @@ def _grid_accounting(problem: GemmProblemSpec, kernel: GemmKernelSpec) -> GridAc
         useful_flops=useful_flops,
         issued_flops=issued_flops,
         tile_efficiency=useful_flops / issued_flops if issued_flops else 0.0,
+    )
+
+
+def _smem_load_per_cta_elements(
+    problem: GemmProblemSpec,
+    kernel: GemmKernelSpec,
+    grid: GridAccounting | None = None,
+) -> int:
+    """EnergAIzer Fig. 4(a) S->R load work per CTA over the full K-loop."""
+    k_stages = grid.k_stages if grid is not None else _ceil_div(problem.k, kernel.cta_k)
+    warp_m_tiles = _ceil_div(kernel.cta_m, kernel.warp_m)
+    warp_n_tiles = _ceil_div(kernel.cta_n, kernel.warp_n)
+    warp_k_tiles = _ceil_div(kernel.cta_k, kernel.warp_k)
+    return (
+        (kernel.warp_m + kernel.warp_n)
+        * warp_m_tiles
+        * warp_n_tiles
+        * k_stages
+        * warp_k_tiles
+        * kernel.warp_k
+    )
+
+
+def _shared_memory_bytes_per_cta(
+    problem: GemmProblemSpec,
+    kernel: GemmKernelSpec,
+    grid: GridAccounting | None = None,
+) -> int:
+    return _ceil_scalar_bytes(
+        _smem_load_per_cta_elements(problem, kernel, grid)
+        * dtype_nbytes(problem.input_dtype)
     )
 
 
@@ -479,7 +1251,7 @@ def _traffic_accounting(
         (kernel.cta_m * kernel.cta_k + kernel.cta_k * kernel.cta_n) * dtype_bytes
     )
     smem_write = grid.cta_count * grid.k_stages * stage_operand_bytes
-    smem_read = smem_write
+    smem_read = grid.cta_count * _shared_memory_bytes_per_cta(problem, kernel, grid)
     sram_read = smem_read if "sram" in hardware.memory_levels else None
     sram_write = smem_write if "sram" in hardware.memory_levels else None
 
@@ -523,6 +1295,7 @@ def _traffic_accounting(
 
 
 def _occupancy(
+    problem: GemmProblemSpec,
     kernel: GemmKernelSpec,
     grid: GridAccounting,
     hardware: HardwareSpec,
@@ -552,10 +1325,11 @@ def _occupancy(
             smem_limit = max_ctas_limit
             warnings.append("shared_memory_bytes_per_sm_absent")
         else:
+            shared_memory_bytes_per_cta = _shared_memory_bytes_per_cta(problem, kernel, grid)
             smem_limit = max(
                 1,
                 hardware.compute.shared_memory_bytes_per_sm
-                // max(1, kernel.shared_memory_bytes_per_cta or 1),
+                // max(1, shared_memory_bytes_per_cta),
             )
         limits = {
             "cta": max_ctas_limit,
@@ -1141,37 +1915,185 @@ def _classify_bottlenecks(
     return primary, tuple(dict.fromkeys(item for item in secondary if item != primary))
 
 
-def _roofline_metrics(
-    problem: GemmProblemSpec,
-    grid: GridAccounting,
-    traffic: TrafficAccounting,
-    timeline: TimelineResult,
-    hardware: HardwareSpec,
-    clock_hz: float,
+def _global_factors(
+    *,
+    useful: float,
+    issued: float,
+    kernel_cycles: float,
     total_device_cycles: float,
-) -> dict[str, dict[str, float | None]]:
-    q_smem = traffic.smem_total_bytes + timeline.epilogue_smem_bytes
-    q_l2 = traffic.l2_requested_bytes
-    q_dram = traffic.dram_unique_bytes
-    useful = grid.useful_flops
-    achieved = useful / max(timeline.kernel_cycles, 1.0e-12)
-    achieved_total = useful / max(total_device_cycles, 1.0e-12)
-    peak_compute = hardware.compute.tensor_flops_per_s[problem.input_dtype] / clock_hz
-    peak_smem = _smem_bandwidth_per_cycle(hardware, clock_hz, [])
-    peak_l2 = (
-        hardware.memory_levels["l2"].bandwidth_bytes_per_s / clock_hz
-        if "l2" in hardware.memory_levels
-        else 0.0
-    )
-    peak_dram = hardware.memory_levels["hbm"].bandwidth_bytes_per_s / clock_hz
-
-    raw = {
-        "compute": peak_compute,
-        "smem": peak_smem * (useful / q_smem) if q_smem else None,
-        "l2": peak_l2 * (useful / q_l2) if q_l2 and peak_l2 else None,
-        "dram": peak_dram * (useful / q_dram) if q_dram else None,
+) -> dict[str, float]:
+    return {
+        "useful_flop_efficiency": useful / max(issued, 1.0e-12),
+        "kernel_scope_efficiency": kernel_cycles / max(total_device_cycles, 1.0e-12),
+        "total_device_overhead_fraction": max(0.0, total_device_cycles - kernel_cycles)
+        / max(total_device_cycles, 1.0e-12),
     }
-    effective = {
+
+
+def _phase_factors(timeline: TimelineResult) -> dict[str, float]:
+    kernel_cycles = max(timeline.kernel_cycles, 1.0e-12)
+    return {
+        "prologue_cycles": timeline.prologue_cycles,
+        "work_cycles": timeline.work_cycles,
+        "epilogue_cycles": timeline.epilogue_cycles,
+        "prologue_fraction": timeline.prologue_cycles / kernel_cycles,
+        "work_fraction": timeline.work_cycles / kernel_cycles,
+        "epilogue_fraction": timeline.epilogue_cycles / kernel_cycles,
+    }
+
+
+def _compute_factors(
+    *,
+    useful: float,
+    issued: float,
+    achieved: float,
+    peak_compute: float,
+    timeline: TimelineResult,
+) -> dict[str, float]:
+    kernel_cycles = max(timeline.kernel_cycles, 1.0e-12)
+    math_group_cycles = max(
+        timeline.mma_issue_cycles + timeline.mma_dependency_penalty_cycles,
+        1.0e-12,
+    )
+    return {
+        "raw_peak_flop_per_cycle": peak_compute,
+        "achieved_flop_per_cycle": achieved,
+        "compute_roof_utilization": achieved / max(peak_compute, 1.0e-12),
+        "useful_flop_efficiency": useful / max(issued, 1.0e-12),
+        "compute_active_cycles": timeline.compute_active_cycles,
+        "compute_active_fraction": timeline.compute_active_cycles / kernel_cycles,
+        "mma_issue_cycles": timeline.mma_issue_cycles,
+        "mma_dependency_penalty_cycles": timeline.mma_dependency_penalty_cycles,
+        "mma_issue_fraction_of_math_group": timeline.mma_issue_cycles
+        / math_group_cycles,
+        "mma_dependency_fraction_of_math_group": timeline.mma_dependency_penalty_cycles
+        / math_group_cycles,
+        "mma_ilp_efficiency": timeline.mma_ilp_efficiency,
+        "compute_issue_utilization": timeline.compute_issue_utilization,
+        "compute_latency_utilization": timeline.compute_latency_utilization,
+    }
+
+
+def _memory_factors(
+    *,
+    q_bytes: float,
+    peak_bytes_per_cycle: float,
+    active_cycles: float,
+    utilization: float,
+    overlap: float | None,
+    exposed_cycles: float,
+    epilogue_bytes: float,
+    useful: float,
+    achieved: float,
+    kernel_cycles: float,
+) -> dict[str, float | None]:
+    kernel = max(kernel_cycles, 1.0e-12)
+    if q_bytes <= 0.0 or peak_bytes_per_cycle <= 0.0:
+        return {
+            "arithmetic_intensity": None,
+            "raw_bound": None,
+            "achieved": achieved,
+            "ceiling_utilization": None,
+            "bytes": q_bytes,
+            "active_cycles_at_peak": None,
+            "active_fraction_of_kernel": None,
+            "timeline_utilization": utilization,
+            "exposed_cycles": exposed_cycles,
+            "exposed_fraction_of_kernel": exposed_cycles / kernel,
+            "hidden_fraction_of_service": None,
+            "compute_overlap": overlap,
+            "epilogue_bytes": epilogue_bytes,
+            "epilogue_byte_fraction": None,
+        }
+
+    raw_bound = peak_bytes_per_cycle * useful / q_bytes
+    return {
+        "arithmetic_intensity": useful / q_bytes,
+        "raw_bound": raw_bound,
+        "achieved": achieved,
+        "ceiling_utilization": achieved / max(raw_bound, 1.0e-12),
+        "bytes": q_bytes,
+        "active_cycles_at_peak": active_cycles,
+        "active_fraction_of_kernel": active_cycles / kernel,
+        "timeline_utilization": utilization,
+        "exposed_cycles": exposed_cycles,
+        "exposed_fraction_of_kernel": exposed_cycles / kernel,
+        "hidden_fraction_of_service": max(
+            0.0, 1.0 - exposed_cycles / max(active_cycles, 1.0e-12)
+        ),
+        "compute_overlap": overlap,
+        "epilogue_bytes": epilogue_bytes,
+        "epilogue_byte_fraction": epilogue_bytes / max(q_bytes, 1.0e-12),
+    }
+
+
+def _critical_path_factors(timeline: TimelineResult) -> dict[str, float]:
+    kernel_cycles = max(timeline.kernel_cycles, 1.0e-12)
+    math_group_cycles = max(
+        timeline.mma_issue_cycles + timeline.mma_dependency_penalty_cycles,
+        1.0e-12,
+    )
+    return {
+        "prologue_fraction": timeline.prologue_cycles / kernel_cycles,
+        "work_fraction": timeline.work_cycles / kernel_cycles,
+        "epilogue_fraction": timeline.epilogue_cycles / kernel_cycles,
+        "exposed_l2_fraction": timeline.exposed_l2_cycles / kernel_cycles,
+        "exposed_dram_fraction": timeline.exposed_dram_cycles / kernel_cycles,
+        "max_exposed_memory_fraction": max(
+            timeline.exposed_l2_cycles,
+            timeline.exposed_dram_cycles,
+        )
+        / kernel_cycles,
+        "mma_dependency_fraction_of_math_group": timeline.mma_dependency_penalty_cycles
+        / math_group_cycles,
+        "compute_inactive_fraction": max(0.0, 1.0 - timeline.compute_active_utilization),
+    }
+
+
+def _classify_attribution_bottleneck(
+    timeline: TimelineResult,
+) -> dict[str, float | str]:
+    kernel_cycles = max(timeline.kernel_cycles, 1.0e-12)
+    math_group_cycles = max(
+        timeline.mma_issue_cycles + timeline.mma_dependency_penalty_cycles,
+        1.0e-12,
+    )
+    scores = {
+        "prologue_dominated": timeline.prologue_cycles / kernel_cycles,
+        "epilogue_dominated": timeline.epilogue_cycles / kernel_cycles,
+        "l2_exposed": timeline.exposed_l2_cycles / kernel_cycles,
+        "dram_exposed": timeline.exposed_dram_cycles / kernel_cycles,
+        "mma_dependency_limited": timeline.mma_dependency_penalty_cycles
+        / math_group_cycles,
+        "compute_underoccupied": max(0.0, 1.0 - timeline.compute_active_utilization),
+    }
+    primary = max(scores, key=scores.__getitem__)
+    sorted_scores = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    secondary, secondary_score = (
+        sorted_scores[1] if len(sorted_scores) > 1 else (primary, scores[primary])
+    )
+    return {
+        "primary": primary,
+        "primary_score": scores[primary],
+        "secondary": secondary,
+        "secondary_score": secondary_score,
+        **scores,
+    }
+
+
+def _deprecated_effective_bounds(
+    *,
+    useful: float,
+    q_smem: float,
+    q_l2: float,
+    q_dram: float,
+    peak_compute: float,
+    peak_smem: float,
+    peak_l2: float,
+    peak_dram: float,
+    timeline: TimelineResult,
+) -> dict[str, float | None]:
+    return {
         "compute": peak_compute
         * timeline.compute_issue_utilization
         * timeline.compute_latency_utilization
@@ -1186,19 +2108,179 @@ def _roofline_metrics(
         if q_dram
         else None,
     }
+
+
+def _validate_roofline_attribution(metrics: Mapping[str, Any]) -> tuple[str, ...]:
+    warnings: list[str] = []
+    raw = metrics["raw_bounds"]
+    achieved = metrics["achieved"]["kernel_scope"]
+    for name, bound in raw.items():
+        if bound is None or bound <= 0.0:
+            continue
+        utilization = achieved / bound
+        if utilization > 1.05:
+            warnings.append(
+                f"{name} utilization exceeds raw bound by more than 5%; "
+                "check traffic accounting, useful/issued FLOPs, or peak rates"
+            )
+
+    breakdown = metrics["factor_breakdown"]
+    global_factors = breakdown["global"]
+    useful_efficiency = global_factors["useful_flop_efficiency"]
+    if useful_efficiency > 1.000001:
+        warnings.append(
+            f"useful FLOP efficiency is {useful_efficiency:.6g}, expected <= 1"
+        )
+
+    phase = breakdown["phase"]
+    phase_sum = (
+        phase["prologue_fraction"]
+        + phase["work_fraction"]
+        + phase["epilogue_fraction"]
+    )
+    if abs(phase_sum - 1.0) > 1.0e-6:
+        warnings.append(f"phase fractions sum to {phase_sum:.6g}, expected 1")
+
+    for name in ("smem", "l2", "dram"):
+        factors = breakdown[name]
+        active_fraction = factors["active_fraction_of_kernel"]
+        timeline_utilization = factors["timeline_utilization"]
+        if active_fraction is not None:
+            expected = min(1.0, active_fraction)
+            if abs(expected - timeline_utilization) > 1.0e-6:
+                warnings.append(
+                    f"{name} active fraction {active_fraction:.6g} does not match "
+                    f"timeline utilization {timeline_utilization:.6g}"
+                )
+        active_cycles = factors["active_cycles_at_peak"]
+        exposed_cycles = factors["exposed_cycles"]
+        if (
+            active_cycles is not None
+            and exposed_cycles is not None
+            and exposed_cycles > active_cycles + 1.0e-6
+        ):
+            warnings.append(
+                f"{name} exposed cycles exceed active service cycles; "
+                "check memory overlap accounting"
+            )
+    return tuple(warnings)
+
+
+def _roofline_metrics(
+    problem: GemmProblemSpec,
+    grid: GridAccounting,
+    traffic: TrafficAccounting,
+    timeline: TimelineResult,
+    hardware: HardwareSpec,
+    clock_hz: float,
+    total_device_cycles: float,
+) -> dict[str, Any]:
+    q_smem = traffic.smem_total_bytes + timeline.epilogue_smem_bytes
+    q_l2 = traffic.l2_requested_bytes
+    q_dram = traffic.dram_unique_bytes
+    useful = grid.useful_flops
+    issued = grid.issued_flops
+    achieved_kernel = useful / max(timeline.kernel_cycles, 1.0e-12)
+    achieved_total_device = useful / max(total_device_cycles, 1.0e-12)
+    peak_compute = hardware.compute.tensor_flops_per_s[problem.input_dtype] / clock_hz
+    peak_smem = _smem_bandwidth_per_cycle(hardware, clock_hz, [])
+    peak_l2 = (
+        hardware.memory_levels["l2"].bandwidth_bytes_per_s / clock_hz
+        if "l2" in hardware.memory_levels
+        else 0.0
+    )
+    peak_dram = hardware.memory_levels["hbm"].bandwidth_bytes_per_s / clock_hz
+
+    raw_bounds = {
+        "compute": peak_compute,
+        "smem": peak_smem * (useful / q_smem) if q_smem else None,
+        "l2": peak_l2 * (useful / q_l2) if q_l2 and peak_l2 else None,
+        "dram": peak_dram * (useful / q_dram) if q_dram else None,
+    }
     ceiling_utilization = {
-        name: achieved / value if value and value > 0.0 else None
-        for name, value in raw.items()
+        name: achieved_kernel / value if value and value > 0.0 else None
+        for name, value in raw_bounds.items()
     }
     total_ceiling_utilization = {
-        name: achieved_total / value if value and value > 0.0 else None
-        for name, value in raw.items()
+        name: achieved_total_device / value if value and value > 0.0 else None
+        for name, value in raw_bounds.items()
     }
+    smem_factors = _memory_factors(
+        q_bytes=q_smem,
+        peak_bytes_per_cycle=peak_smem,
+        active_cycles=timeline.smem_active_cycles,
+        utilization=timeline.smem_utilization,
+        overlap=timeline.compute_smem_overlap,
+        exposed_cycles=0.0,
+        epilogue_bytes=timeline.epilogue_smem_bytes,
+        useful=useful,
+        achieved=achieved_kernel,
+        kernel_cycles=timeline.kernel_cycles,
+    )
+    l2_factors = _memory_factors(
+        q_bytes=q_l2,
+        peak_bytes_per_cycle=peak_l2,
+        active_cycles=timeline.l2_active_cycles,
+        utilization=timeline.l2_utilization,
+        overlap=timeline.compute_l2_overlap,
+        exposed_cycles=timeline.exposed_l2_cycles,
+        epilogue_bytes=timeline.epilogue_l2_bytes,
+        useful=useful,
+        achieved=achieved_kernel,
+        kernel_cycles=timeline.kernel_cycles,
+    )
+    dram_factors = _memory_factors(
+        q_bytes=q_dram,
+        peak_bytes_per_cycle=peak_dram,
+        active_cycles=timeline.dram_active_cycles,
+        utilization=timeline.dram_utilization,
+        overlap=timeline.compute_dram_overlap,
+        exposed_cycles=timeline.exposed_dram_cycles,
+        epilogue_bytes=timeline.epilogue_dram_bytes,
+        useful=useful,
+        achieved=achieved_kernel,
+        kernel_cycles=timeline.kernel_cycles,
+    )
     return {
-        "raw_bounds": raw,
-        "effective_bounds": effective,
+        "raw_bounds": raw_bounds,
+        "achieved": {
+            "kernel_scope": achieved_kernel,
+            "device_scope": achieved_total_device,
+        },
         "ceiling_utilization": ceiling_utilization,
         "total_ceiling_utilization": total_ceiling_utilization,
+        "factor_breakdown": {
+            "global": _global_factors(
+                useful=useful,
+                issued=issued,
+                kernel_cycles=timeline.kernel_cycles,
+                total_device_cycles=total_device_cycles,
+            ),
+            "phase": _phase_factors(timeline),
+            "compute": _compute_factors(
+                useful=useful,
+                issued=issued,
+                achieved=achieved_kernel,
+                peak_compute=peak_compute,
+                timeline=timeline,
+            ),
+            "smem": smem_factors,
+            "l2": l2_factors,
+            "dram": dram_factors,
+            "critical_path": _critical_path_factors(timeline),
+            "bottleneck_classification": _classify_attribution_bottleneck(timeline),
+        },
+        "effective_bounds_deprecated": _deprecated_effective_bounds(
+            useful=useful,
+            q_smem=q_smem,
+            q_l2=q_l2,
+            q_dram=q_dram,
+            peak_compute=peak_compute,
+            peak_smem=peak_smem,
+            peak_l2=peak_l2,
+            peak_dram=peak_dram,
+            timeline=timeline,
+        ),
     }
 
 
@@ -1222,6 +2304,10 @@ def _diagnostics(
     primary, secondary = bottlenecks
     total_device_cycles = timeline.kernel_cycles + fixed_overhead_cycles
     fixed_overhead_fraction = fixed_overhead_cycles / max(total_device_cycles, 1.0e-12)
+    smem_load_per_cta_elements = _smem_load_per_cta_elements(problem, kernel, grid)
+    shared_memory_bytes_per_cta = _ceil_scalar_bytes(
+        smem_load_per_cta_elements * dtype_nbytes(problem.input_dtype)
+    )
     q_smem = traffic.smem_total_bytes + timeline.epilogue_smem_bytes
     q_l2 = traffic.l2_requested_bytes
     q_dram = traffic.dram_unique_bytes
@@ -1236,6 +2322,11 @@ def _diagnostics(
         clock_hz,
         total_device_cycles,
     )
+    attribution_warnings = tuple(
+        f"roofline_attribution: {message}"
+        for message in _validate_roofline_attribution(roofline_metrics)
+    )
+    all_warnings = warnings + attribution_warnings
     return {
         "problem": {
             "batch": problem.batch,
@@ -1258,7 +2349,8 @@ def _diagnostics(
             "warps_per_cta": kernel.warps_per_cta,
             "threads_per_cta": kernel.threads_per_cta,
             "registers_per_thread": kernel.registers_per_thread,
-            "shared_memory_bytes_per_cta": kernel.shared_memory_bytes_per_cta,
+            "smem_load_per_cta_elements": smem_load_per_cta_elements,
+            "shared_memory_bytes_per_cta": shared_memory_bytes_per_cta,
             "max_concurrent_ctas_per_sm": kernel.max_concurrent_ctas_per_sm,
             "slice_k": kernel.slice_k,
         },
@@ -1373,12 +2465,19 @@ def _diagnostics(
             "dram_flop_per_byte": useful / q_dram if q_dram else None,
             "merged_flop_per_byte": useful / total_q if total_q else None,
         },
-        "roofline_bounds_flop_per_cycle": roofline_metrics["effective_bounds"],
+        "roofline_bounds_flop_per_cycle": roofline_metrics[
+            "effective_bounds_deprecated"
+        ],
+        "roofline_effective_bounds_deprecated_flop_per_cycle": roofline_metrics[
+            "effective_bounds_deprecated"
+        ],
         "roofline_raw_bounds_flop_per_cycle": roofline_metrics["raw_bounds"],
+        "roofline_achieved_flop_per_cycle": roofline_metrics["achieved"],
         "roofline_ceiling_utilization": roofline_metrics["ceiling_utilization"],
         "roofline_total_ceiling_utilization": roofline_metrics[
             "total_ceiling_utilization"
         ],
+        "roofline_factor_breakdown": roofline_metrics["factor_breakdown"],
         "memory_level_latencies_s": {
             "hbm": hardware.memory_levels["hbm"].latency_s,
             "l2": hardware.memory_levels["l2"].latency_s
@@ -1391,7 +2490,7 @@ def _diagnostics(
         },
         "primary_bottleneck": primary,
         "secondary_bottlenecks": secondary,
-        "warnings": warnings,
+        "warnings": all_warnings,
         "assumptions": (
             "deterministic_tiled_gemm_access_pattern",
             "first_touch_l2_reuse_when_l2_exists",

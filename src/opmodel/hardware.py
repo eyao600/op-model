@@ -49,14 +49,41 @@ class Utilization:
 
 
 @dataclass(frozen=True)
+class EnergyModelPowerCoefficients:
+    base_power_w: float = 0.0
+    sm_resident_power_w: float = 0.0
+    tc_active_power_w: float = 0.0
+    dram_active_power_w: float = 0.0
+    l2_active_power_w: float = 0.0
+    smem_active_power_w: float = 0.0
+
+
+@dataclass(frozen=True)
+class EnergyModelSpec:
+    model_level: str = "E3"
+    power_coefficients: EnergyModelPowerCoefficients = field(
+        default_factory=EnergyModelPowerCoefficients
+    )
+    feature_order: tuple[str, ...] = (
+        "time_kernel_s",
+        "time_sm_resident_s",
+        "time_tc_active_s",
+        "time_dram_active_s",
+        "time_l2_active_s",
+        "time_smem_active_s",
+    )
+    calibration: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class HardwareSpec:
     name: str
     kind: str
     compute: ComputeUnit
     memory_levels: Mapping[str, MemoryLevel]
     utilization: Utilization = field(default_factory=Utilization)
-    kernel_launch_overhead_s: float = 0.0
     static_power_w: float = 0.0
+    energy_model: EnergyModelSpec | None = None
 
 
 def load_hardware(path: str | Path) -> HardwareSpec:
@@ -151,8 +178,8 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
         compute=compute,
         memory_levels=memory_levels,
         utilization=utilization,
-        kernel_launch_overhead_s=float(data.get("kernel_launch_overhead_s", 0.0)),
         static_power_w=float(data.get("static_power_w", 0.0)),
+        energy_model=_parse_energy_model(data.get("energy_model")),
     )
 
 
@@ -196,10 +223,10 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
         value = getattr(hardware.compute, field_name)
         if value is not None and value <= 0:
             raise ValueError(f"compute.{field_name} must be positive")
-    if hardware.kernel_launch_overhead_s < 0:
-        raise ValueError("kernel_launch_overhead_s must be non-negative")
     if hardware.static_power_w < 0:
         raise ValueError("static_power_w must be non-negative")
+    if hardware.energy_model is not None:
+        _validate_energy_model(hardware.energy_model)
 
     for level in hardware.memory_levels.values():
         if level.bandwidth_bytes_per_s <= 0:
@@ -229,6 +256,56 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
 def _validate_utilization(name: str, value: float) -> None:
     if not 0.0 < value <= 1.0:
         raise ValueError(f"Utilization {name} must be in (0, 1]")
+
+
+def _parse_energy_model(data: Any) -> EnergyModelSpec | None:
+    if data is None:
+        return None
+    mapping = _expect_mapping(data, "energy_model")
+    coefficients_data = _expect_mapping(
+        mapping.get("power_coefficients", {}),
+        "energy_model.power_coefficients",
+    )
+    feature_order_data = mapping.get("feature_order", EnergyModelSpec.feature_order)
+    if not isinstance(feature_order_data, (list, tuple)):
+        raise ValueError("energy_model.feature_order must be a list")
+    return EnergyModelSpec(
+        model_level=str(mapping.get("model_level", "E3")),
+        power_coefficients=EnergyModelPowerCoefficients(
+            base_power_w=float(coefficients_data.get("base_power_w", 0.0)),
+            sm_resident_power_w=float(
+                coefficients_data.get("sm_resident_power_w", 0.0)
+            ),
+            tc_active_power_w=float(coefficients_data.get("tc_active_power_w", 0.0)),
+            dram_active_power_w=float(
+                coefficients_data.get("dram_active_power_w", 0.0)
+            ),
+            l2_active_power_w=float(coefficients_data.get("l2_active_power_w", 0.0)),
+            smem_active_power_w=float(
+                coefficients_data.get("smem_active_power_w", 0.0)
+            ),
+        ),
+        feature_order=tuple(str(item) for item in feature_order_data),
+        calibration=dict(_expect_mapping(mapping.get("calibration", {}), "energy_model.calibration")),
+    )
+
+
+def _validate_energy_model(energy_model: EnergyModelSpec) -> None:
+    if energy_model.model_level not in {"E0", "E1", "E2", "E3"}:
+        raise ValueError("energy_model.model_level must be one of E0, E1, E2, E3")
+    if not energy_model.feature_order:
+        raise ValueError("energy_model.feature_order must not be empty")
+    coefficients = energy_model.power_coefficients
+    for field_name in (
+        "base_power_w",
+        "sm_resident_power_w",
+        "tc_active_power_w",
+        "dram_active_power_w",
+        "l2_active_power_w",
+        "smem_active_power_w",
+    ):
+        if getattr(coefficients, field_name) < 0.0:
+            raise ValueError(f"energy_model.power_coefficients.{field_name} must be non-negative")
 
 
 def _dtype_float_map(data: Any, field_name: str) -> dict[DType, float]:

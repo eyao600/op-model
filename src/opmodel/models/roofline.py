@@ -304,7 +304,7 @@ def _make_profile(
     )
     compute_latency = 0.0 if flops == 0.0 else flops / effective_flops
     roofline_latency = max(compute_latency, memory_latency)
-    latency = hardware.kernel_launch_overhead_s + roofline_latency
+    latency = roofline_latency
     energy_breakdown = estimate_energy(
         flops=flops,
         memory_access=memory_access,
@@ -318,7 +318,6 @@ def _make_profile(
         "compute_latency_s": compute_latency,
         "memory_latency_s": memory_latency,
         "roofline_latency_s": roofline_latency,
-        "kernel_launch_overhead_s": hardware.kernel_launch_overhead_s,
         "effective_flops_per_s": effective_flops,
         "effective_hbm_bandwidth_bytes_per_s": hbm_bw,
         "memory_level_latencies_s": level_latencies,
