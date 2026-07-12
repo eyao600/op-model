@@ -9,11 +9,6 @@ from typing import Any, Mapping
 import yaml
 
 from opmodel.api import DType, LocalOp, OpKind, OpProfile, Phase, TensorRole, TensorSpec
-from opmodel.calibration import (
-    calibrate_energy_from_artifact_database,
-    format_calibration_report,
-    write_calibrated_hardware_config,
-)
 from opmodel.hardware import load_hardware
 from opmodel.registry import create_model
 from opmodel.validation.artifact_accuracy import (
@@ -24,6 +19,14 @@ from opmodel.validation.artifact_accuracy import (
     write_csv_report,
     write_performance_details_csv_report,
     write_validation_plots,
+)
+from opmodel.validation.gemm_latency import (
+    DEFAULT_GEMM_LATENCY_DATA_DIR,
+    DEFAULT_TRAINING_PER_CLASS,
+    format_gemm_latency_report,
+    run_gemm_latency_validation,
+    write_gemm_latency_csv,
+    write_gemm_latency_params,
 )
 
 
@@ -50,6 +53,25 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         help="fixed y-axis maximum for generated workload bar plots",
     )
+
+    gemm_latency_parser = subparsers.add_parser("validate-gemm-latency")
+    gemm_latency_parser.add_argument("--data-dir", default=str(DEFAULT_GEMM_LATENCY_DATA_DIR))
+    gemm_latency_parser.add_argument("--hardware-dir", default=str(DEFAULT_HARDWARE_DIR))
+    gemm_latency_parser.add_argument("--model", default="extended_roofline")
+    gemm_latency_parser.add_argument(
+        "--no-calibrate-fixed-overhead",
+        action="store_true",
+        help="use hardware config fixed overhead as-is",
+    )
+    gemm_latency_parser.add_argument(
+        "--training-per-class",
+        type=int,
+        default=DEFAULT_TRAINING_PER_CLASS,
+        help="maximum training rows per hardware for each overhead training class",
+    )
+    gemm_latency_parser.add_argument("--limit", type=int, help="maximum supported GEMM rows")
+    gemm_latency_parser.add_argument("--output-csv")
+    gemm_latency_parser.add_argument("--output-params")
 
     calibrate_parser = subparsers.add_parser("calibrate-energy")
     calibrate_parser.add_argument("--data-dir", default=str(DEFAULT_ARTIFACT_DATA_DIR))
@@ -93,7 +115,32 @@ def main(argv: list[str] | None = None) -> int:
         for plot_path in plot_paths:
             print(f"Wrote normalized plot: {plot_path}")
         return 0
+    if args.command == "validate-gemm-latency":
+        report = run_gemm_latency_validation(
+            data_dir=args.data_dir,
+            hardware_dir=args.hardware_dir,
+            model_name=args.model,
+            calibrate_fixed_overhead=not args.no_calibrate_fixed_overhead,
+            training_per_class=args.training_per_class,
+            limit=args.limit,
+        )
+        if args.output_csv:
+            write_gemm_latency_csv(report, args.output_csv)
+        if args.output_params:
+            write_gemm_latency_params(report, args.output_params)
+        print(format_gemm_latency_report(report))
+        if args.output_csv:
+            print(f"Wrote GEMM latency CSV report: {args.output_csv}")
+        if args.output_params:
+            print(f"Wrote GEMM latency parameters: {args.output_params}")
+        return 0
     if args.command == "calibrate-energy":
+        from opmodel.calibration import (
+            calibrate_energy_from_artifact_database,
+            format_calibration_report,
+            write_calibrated_hardware_config,
+        )
+
         result = calibrate_energy_from_artifact_database(
             hardware_name=args.hardware,
             data_dir=args.data_dir,
