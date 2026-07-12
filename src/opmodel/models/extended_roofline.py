@@ -1689,6 +1689,18 @@ def _wave_pipeline(
         dram_latency_cycles=dram_latency_cycles,
     )
     (
+        memory_full_steady_cycles,
+        l2_full_steady_cycles,
+        dram_full_steady_cycles,
+    ) = _memory_pipeline_stage_bandwidth_cycles(
+        active_ctas=active_ctas,
+        stage_equivalent=float(full_memory_stages),
+        avg_l2_load_bytes_per_cta_stage=avg_l2_load_bytes_per_cta_stage,
+        avg_dram_load_bytes_per_cta_stage=avg_dram_load_bytes_per_cta_stage,
+        peak_l2_bw_per_cycle=peak_l2_bw_per_cycle,
+        peak_hbm_bw_per_cycle=peak_hbm_bw_per_cycle,
+    )
+    (
         memory_last_stage_cycles,
         l2_last_stage_cycles,
         dram_last_stage_cycles,
@@ -1709,7 +1721,7 @@ def _wave_pipeline(
         else sm_last_stage_cycles
     )
     memory_path_cycles = sm_stage_cycles + sm_last_stage_cycles + (
-        memory_full_stage_cycles * max(0, memory_pipeline_groups - 1)
+        memory_full_steady_cycles * max(0, memory_pipeline_groups - 1)
         + memory_last_stage_cycles
     )
     work_cycles = max(sm_path_cycles, memory_path_cycles) if grid.k_stages > 1 else sm_path_cycles
@@ -1764,10 +1776,10 @@ def _wave_pipeline(
     end_cycles = epilogue_smem_cycles + slice_k_extra_cycles + epilogue_global_cycles
 
     l2_pipeline_cycles = (
-        l2_full_stage_cycles * max(0, memory_pipeline_groups - 1) + l2_last_stage_cycles
+        l2_full_steady_cycles * max(0, memory_pipeline_groups - 1) + l2_last_stage_cycles
     )
     dram_pipeline_cycles = (
-        dram_full_stage_cycles * max(0, memory_pipeline_groups - 1) + dram_last_stage_cycles
+        dram_full_steady_cycles * max(0, memory_pipeline_groups - 1) + dram_last_stage_cycles
     )
     exposed_l2_cycles = max(0.0, l2_pipeline_cycles - sm_path_cycles)
     exposed_dram_cycles = max(0.0, dram_pipeline_cycles - sm_path_cycles)
@@ -1822,6 +1834,30 @@ def _memory_pipeline_stage_cycles(
     dram_bytes = active_ctas * stage_equivalent * avg_dram_load_bytes_per_cta_stage
     l2_cycles = _service_cycles(l2_bytes, peak_l2_bw_per_cycle, l2_latency_cycles)
     dram_cycles = _service_cycles(dram_bytes, peak_hbm_bw_per_cycle, dram_latency_cycles)
+    return max(l2_cycles, dram_cycles), l2_cycles, dram_cycles
+
+
+def _memory_pipeline_stage_bandwidth_cycles(
+    *,
+    active_ctas: int,
+    stage_equivalent: float,
+    avg_l2_load_bytes_per_cta_stage: float,
+    avg_dram_load_bytes_per_cta_stage: float,
+    peak_l2_bw_per_cycle: float,
+    peak_hbm_bw_per_cycle: float,
+) -> tuple[float, float, float]:
+    l2_bytes = active_ctas * stage_equivalent * avg_l2_load_bytes_per_cta_stage
+    dram_bytes = active_ctas * stage_equivalent * avg_dram_load_bytes_per_cta_stage
+    l2_cycles = (
+        l2_bytes / peak_l2_bw_per_cycle
+        if l2_bytes > 0.0 and peak_l2_bw_per_cycle > 0.0
+        else 0.0
+    )
+    dram_cycles = (
+        dram_bytes / peak_hbm_bw_per_cycle
+        if dram_bytes > 0.0 and peak_hbm_bw_per_cycle > 0.0
+        else 0.0
+    )
     return max(l2_cycles, dram_cycles), l2_cycles, dram_cycles
 
 
