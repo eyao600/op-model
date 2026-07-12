@@ -1655,7 +1655,10 @@ def _wave_pipeline(
         if concurrent_mma > 0
         else 0.0
     )
-    math_latency_group_cycles = mma_k_iters * tensor_latency_cycles if concurrent_mma > 0 else 0.0
+    if concurrent_mma > 0 and (kernel.mma_m, kernel.mma_n, kernel.mma_k) == (1, 1, 1):
+        math_latency_group_cycles = math_issue_group_cycles
+    else:
+        math_latency_group_cycles = mma_k_iters * tensor_latency_cycles if concurrent_mma > 0 else 0.0
     math_group_cycles = max(math_issue_group_cycles, math_latency_group_cycles)
     per_group_cycles = max(smem_group_cycles, math_group_cycles)
     sm_stage_cycles = smem_group_cycles + math_group_cycles + (
