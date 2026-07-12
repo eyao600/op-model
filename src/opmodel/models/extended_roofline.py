@@ -1742,7 +1742,7 @@ def _wave_pipeline(
     warptile_reg_to_smem_bytes = effective_warp_m * effective_warp_n * output_dtype_bytes
     epilogue_smem_cycles = (
         max(active_warps * warptile_reg_to_smem_bytes / max(per_sm_smem_bw, 1.0e-12),
-            shared_latency_cycles)
+            exposed_shared_latency_cycles)
         if active_warps > 0
         else 0.0
     )
@@ -1752,7 +1752,7 @@ def _wave_pipeline(
             active_warps
             * warptile_reg_to_smem_bytes
             / max(per_sm_smem_bw * kernel.num_warp_tile_k, 1.0e-12),
-            shared_latency_cycles,
+            exposed_shared_latency_cycles,
         )
         if kernel.slice_k and active_warps > 0
         else 0.0
