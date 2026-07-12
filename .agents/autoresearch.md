@@ -46,7 +46,11 @@ env PYTHONPATH=src python3 -m opmodel.cli validate-gemm-latency --data-dir data
 
 Use the reported full held-out `all/all` MAPE as the primary objective. Also
 inspect per-class metrics and prioritize the currently worst class, especially
-`small` and `vector_like` when they dominate error.
+`small` and `vector_like` when they dominate error. Do not significantly
+sacrifice any kernel class metric merely to improve aggregate MAPE; reject
+changes that create a large per-class MAPE regression unless the regression is
+small, well-understood, and outweighed by broad improvements across other
+classes.
 
 ## Results Log
 
@@ -96,7 +100,7 @@ Keep the model a simple calculator:
 
 - Avoid cycle-level simulation.
 - Avoid major overhauls.
-- Reject changes that make validation more than 10x slower.
+- Reject changes that make validation more than 5x slower.
 - Prefer simple first-principles corrections.
 - Removing false or unnecessary modeling is encouraged.
 
@@ -107,11 +111,11 @@ For each iteration:
 1. Inspect the latest validation metrics and identify the highest-error class.
 2. Form one analytical hypothesis about a likely modeling error.
 3. Modify only `src/opmodel/models/extended_roofline.py`.
-4. Spend at most 5 minutes tuning code before validation.
+4. Spend at most 10 minutes tuning code before validation.
 5. Run exactly one full validation pass.
 6. Append the result to `results.tsv`.
-7. Keep and commit only if the full held-out MAPE improves and the change is
-   analytically defensible.
+7. Keep and commit only if the full held-out MAPE improves, no kernel class
+   metric regresses significantly, and the change is analytically defensible.
 8. If kept, continue improving from the new commit.
 9. If rejected, discard the change and try a different hypothesis from the
    most recent kept commit.
