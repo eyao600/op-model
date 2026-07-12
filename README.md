@@ -75,6 +75,22 @@ and likely bottlenecks. Kernel parameters such as `cta_tile_m`, `cta_tile_n`,
 conservative defaults are used when they are omitted. Non-GEMM ops reuse the
 standard `roofline` estimators.
 
+To validate the extended GEMM latency timeline against the local GEMM latency
+CSVs in `data/`:
+
+```bash
+opmodel validate-gemm-latency --data-dir data
+```
+
+This command uses `extended_roofline`, loads hardware inputs from
+`src/opmodel/configs/hardware/`, and calibrates only fixed device overhead
+cycles. It selects a small deterministic set of `small` and `vector_like` GEMMs
+for overhead calibration, then reports held-out latency error for every other
+supported GEMM row overall, by hardware, and by GEMM size class. Use
+`--no-calibrate-fixed-overhead` to report accuracy with the hardware config
+overhead as-is, `--output-csv` for per-row predictions, and `--output-params`
+for the resolved overhead inputs and training rows.
+
 To compare bf16 predictions against the EnergAIzer artifact data and write a
 normalized SVG scatter plot:
 
