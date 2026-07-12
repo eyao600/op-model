@@ -2645,6 +2645,9 @@ def _smem_bandwidth_per_cycle(
     sram = hardware.memory_levels.get("sram")
     if sram is not None:
         return sram.bandwidth_bytes_per_s / clock_hz
+    if hardware.compute.num_sms is not None:
+        warnings.append("sram_level_absent_smem_bandwidth_inferred_from_shared_banks")
+        return float(hardware.compute.num_sms * 32 * 4)
     warnings.append("sram_level_absent_smem_bandwidth_inferred_from_hbm")
     return hardware.memory_levels["hbm"].bandwidth_bytes_per_s * 8.0 / clock_hz
 
