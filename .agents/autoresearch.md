@@ -88,11 +88,19 @@ Changes must remain analytical and hardware-grounded:
   calibration performed by the validation harness.
 - Do not tune constants to the dataset.
 - Do not add shape-specific lookup tables or per-kernel special cases.
+- Do not introduce heuristic shape-regime switches such as `M < 64`,
+  `min(M, N) <= threshold`, aspect-ratio buckets, or validation-class labels as
+  modeling behavior unless there is clear documentation or explicit kernel
+  metadata showing that real GPU kernels dispatch or execute differently on
+  that boundary. Shape classifications may be used for reporting only, not as
+  hidden calibration logic.
 - Do not modify hardware YAMLs or validation code.
 - Derive outputs from problem dimensions, kernel attrs, and `HardwareSpec`.
 - Ground changes in GPU microarchitecture and NVIDIA CUTLASS GEMM behavior.
 - Reject changes that are unrealistic, unfounded, or only improve metrics by
   overfitting.
+- Reject changes that make the model less hardware-agnostic by encoding
+  benchmark-specific or dataset-discovered shape regimes.
 
 ## Runtime Constraints
 
