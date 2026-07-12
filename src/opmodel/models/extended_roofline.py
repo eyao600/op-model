@@ -1768,7 +1768,7 @@ def _wave_pipeline(
     dram_epilogue_cycles = _service_cycles(
         dram_epilogue_bytes, peak_hbm_bw_per_cycle, dram_latency_cycles
     )
-    epilogue_global_cycles = max(l2_epilogue_cycles, dram_epilogue_cycles)
+    epilogue_global_cycles = l2_epilogue_cycles + dram_epilogue_cycles
     end_cycles = epilogue_smem_cycles + slice_k_extra_cycles + epilogue_global_cycles
 
     l2_pipeline_cycles = (
