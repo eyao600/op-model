@@ -1633,14 +1633,15 @@ def _wave_pipeline(
     warptile_smem_to_reg_bytes = (
         (effective_warp_m + effective_warp_n) * effective_warp_k * dtype_bytes
     )
+    smsp_warps = _ceil_div(active_warps, 4) if active_warps else 0
+    exposed_shared_latency_cycles = shared_latency_cycles / max(1, smsp_warps)
     smem_group_cycles = (
         max(active_warps * warptile_smem_to_reg_bytes / max(per_sm_smem_bw, 1.0e-12),
-            shared_latency_cycles)
+            exposed_shared_latency_cycles)
         if active_warps > 0
         else 0.0
     )
 
-    smsp_warps = _ceil_div(active_warps, 4) if active_warps else 0
     concurrent_mma = (
         smsp_warps
         * _ceil_div(effective_warp_m, kernel.mma_m)
