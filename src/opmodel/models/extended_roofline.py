@@ -2715,7 +2715,7 @@ def _tensor_latency_cycles(
     if hardware.compute.tensor_latency_cycles is not None:
         return float(hardware.compute.tensor_latency_cycles)
     default = {
-        (16, 8, 8): 17.5,
+        (16, 8, 8): 26.0,
         (16, 8, 16): 26.0,
         (16, 16, 16): 26.0,
     }.get((kernel.mma_m, kernel.mma_n, kernel.mma_k), 8.0)
