@@ -33,9 +33,6 @@ During experiments, code and model changes are limited to:
 - `src/opmodel/calibration.py`
 - `src/opmodel/hardware.py`, only when a proposed model needs additional named
   nonnegative power coefficients in `EnergyModelPowerCoefficients`
-- `src/opmodel/models/extended_roofline.py`, only for memory-traffic accounting
-  formulas that are grounded in exposed kernel/hardware metadata or documented
-  GPU/CUTLASS behavior, and only when timing behavior is unchanged
 
 The agent may create or append untracked local research artifacts:
 
@@ -52,11 +49,11 @@ Do not modify:
 
 - hardware YAMLs to store fitted coefficients or calibration metadata
 - `src/opmodel/validation/gemm_latency.py`
-- `src/opmodel/models/extended_roofline.py`, except for the allowed
-  evidence-grounded memory-traffic accounting formulas above
+- `src/opmodel/models/extended_roofline.py`
 - FLOP energy coefficients in `compute.*_energy_j_per_flop`
 - byte-event coefficients in `memory.levels[*].energy_j_per_byte`
 - timing-model behavior or latency-calibration behavior
+- GEMM memory traffic formulas for timing or energy
 
 ## Calibration And Validation Protocol
 
@@ -80,6 +77,10 @@ Fit only residual or static power terms with nonnegative regression:
 - fixed event energy remains
   `compute_j + hbm_j + l2_j + sram_j + register_j` from hardware config
   coefficients
+- memory traffic formulas are fixed and shared by timing and energy:
+  - L2 traffic is the full L2-to-SHMEM A/B staging stream only
+  - SHMEM/SRAM traffic is the full SHMEM-to-register operand stream only
+  - HBM traffic remains first-touch A/B plus C reads when present and D stores
 - residual target is
   `measured_energy_j - fixed_event_energy_j(profile)`
 
@@ -99,8 +100,12 @@ Guardrails:
 - do not significantly regress any kernel class for a small aggregate gain
 - reject shape-regime heuristics unless backed by real exposed kernel or
   hardware metadata
-- reject memory-traffic formula changes that are not backed by diagnostics,
-  kernel metadata, hardware metadata, or documented GPU/CUTLASS behavior
+- reject all memory-traffic formula changes; the current formulas are fixed by
+  user instruction and apply to both timing and energy
+- reject changes that remove a real hardware event component entirely; event
+  components such as FLOPs, HBM, L2, SRAM, and register movement may be
+  remapped or reduced only when the resulting nonzero traffic formula remains
+  physically grounded
 - reject changes that make validation more than 5x slower
 - reject changes that hide fitted values in tracked config or source files
 

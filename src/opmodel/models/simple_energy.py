@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from opmodel.api import DType, EnergyBreakdown, EngineKind, MemoryAccess
 from opmodel.hardware import HardwareSpec
 
@@ -63,4 +65,8 @@ def _level_energy(
     level = hardware.memory_levels.get(name)
     if level is None:
         return 0.0
-    return ((read_bytes or 0) + (write_bytes or 0)) * level.energy_j_per_byte
+    byte_count = (read_bytes or 0) + (write_bytes or 0)
+    if level.energy_j_per_sector is not None:
+        sector_size = level.sector_size_bytes or 32
+        return math.ceil(byte_count / sector_size) * level.energy_j_per_sector
+    return byte_count * level.energy_j_per_byte

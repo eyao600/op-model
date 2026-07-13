@@ -37,18 +37,21 @@ memory:
       size_bytes: 6291456
       bandwidth_bytes_per_s: 4.608e12
       energy_j_per_byte: 3.2552083333333334e-11
+      energy_j_per_sector: 3.68e-10 # Delestrac et al A100 value
     - name: sram
       # 100 KiB/SM * 72 SMs. Bandwidth is inferred from 32 shared-memory
       # banks * 4 B/bank/cycle/SM at the 900 MHz modeled clock.
       size_bytes: 7372800
       bandwidth_bytes_per_s: 8.2944e12
       energy_j_per_byte: 1.272e-11
+      energy_j_per_sector: 8.21e-11 # Delestrac et al A100 value
       bank_count: 32
       bank_width_bytes: 4
     - name: hbm
       size_bytes: 25769803776
       bandwidth_bytes_per_s: 6.0e11
       energy_j_per_byte: 2.5e-10
+      energy_j_per_sector: 2.09e-9 # Delestrac et al A100 value
 
 utilization:
   vector: 1.0

@@ -15,6 +15,7 @@ class MemoryLevel:
     size_bytes: int | None
     bandwidth_bytes_per_s: float
     energy_j_per_byte: float
+    energy_j_per_sector: float | None = None
     latency_s: float = 0.0
     line_size_bytes: int | None = None
     sector_size_bytes: int | None = None
@@ -148,6 +149,7 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
             size_bytes=_optional_int(level_data.get("size_bytes")),
             bandwidth_bytes_per_s=float(level_data.get("bandwidth_bytes_per_s", 0.0)),
             energy_j_per_byte=float(level_data.get("energy_j_per_byte", 0.0)),
+            energy_j_per_sector=_optional_float(level_data.get("energy_j_per_sector")),
             latency_s=float(level_data.get("latency_s", 0.0)),
             line_size_bytes=_optional_int(level_data.get("line_size_bytes")),
             sector_size_bytes=_optional_int(level_data.get("sector_size_bytes")),
@@ -233,6 +235,10 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
             raise ValueError(f"Memory bandwidth for {level.name} must be positive")
         if level.energy_j_per_byte < 0:
             raise ValueError(f"Memory energy for {level.name} must be non-negative")
+        if level.energy_j_per_sector is not None and level.energy_j_per_sector < 0:
+            raise ValueError(
+                f"Memory sector energy for {level.name} must be non-negative"
+            )
         if level.latency_s < 0:
             raise ValueError(f"Memory latency for {level.name} must be non-negative")
         for field_name in (

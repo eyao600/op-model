@@ -1239,6 +1239,7 @@ def _traffic_accounting(
     c_read_tx = d_store_tx if problem.epilogue_reads_c else 0
     l2_read = a_requested_tx + b_requested_tx + c_read_tx if l2_level is not None else None
     l2_write = d_store_tx if l2_level is not None else None
+    l2_to_smem_bytes = a_requested_tx + b_requested_tx if l2_level is not None else None
     if l2_level is None:
         hbm_read = a_requested_tx + b_requested_tx + c_read_tx
         hbm_write = d_store_tx
@@ -1253,14 +1254,14 @@ def _traffic_accounting(
     smem_write = grid.cta_count * grid.k_stages * stage_operand_bytes
     smem_read = grid.cta_count * _shared_memory_bytes_per_cta(problem, kernel, grid)
     sram_read = smem_read if "sram" in hardware.memory_levels else None
-    sram_write = smem_write if "sram" in hardware.memory_levels else None
+    sram_write = 0 if "sram" in hardware.memory_levels else None
 
     return TrafficAccounting(
         memory_access=MemoryAccess(
             hbm_read_bytes=hbm_read,
             hbm_write_bytes=hbm_write,
-            l2_read_bytes=l2_read,
-            l2_write_bytes=l2_write,
+            l2_read_bytes=l2_to_smem_bytes,
+            l2_write_bytes=0 if l2_level is not None else None,
             sram_read_bytes=sram_read,
             sram_write_bytes=sram_write,
         ),
@@ -1285,10 +1286,10 @@ def _traffic_accounting(
         b_dram_unique_bytes=b_unique_dram_tx,
         c_read_transaction_bytes=c_read_tx,
         d_store_transaction_bytes=d_store_tx,
-        l2_requested_bytes=(l2_read or 0) + (l2_write or 0),
+        l2_requested_bytes=l2_to_smem_bytes or 0,
         dram_unique_bytes=hbm_read + hbm_write,
         smem_read_bytes=smem_read,
-        smem_write_bytes=smem_write,
+        smem_write_bytes=0,
         sector_size_bytes=sector_size,
         line_size_bytes=line_size,
     )
@@ -1734,12 +1735,7 @@ def _wave_pipeline(
     )
 
     wave_fraction = active_ctas / max(1, grid.cta_count)
-    l2_epilogue_bytes = (
-        wave_fraction
-        * (traffic.d_store_transaction_bytes + traffic.c_read_transaction_bytes)
-        if peak_l2_bw_per_cycle > 0.0
-        else 0.0
-    )
+    l2_epilogue_bytes = 0.0
     dram_epilogue_bytes = wave_fraction * (
         traffic.d_store_transaction_bytes + traffic.c_read_transaction_bytes
     )

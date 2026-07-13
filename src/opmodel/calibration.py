@@ -7,12 +7,10 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
 
-import numpy as np
 import yaml
 
 from opmodel.api import OpKind
 from opmodel.energy import (
-    E3_POWER_FEATURE_ORDER,
     extract_gemm_e3_features,
     fixed_event_energy_j,
 )
@@ -33,6 +31,7 @@ from opmodel.validation.artifact_accuracy import (
     _sample_from_row,
     _supported_op_kind,
 )
+from opmodel.validation.gemm_latency import classify_gemm_size
 
 
 _POWER_COEFFICIENT_FIELDS = (
@@ -42,6 +41,16 @@ _POWER_COEFFICIENT_FIELDS = (
     "dram_active_power_w",
     "l2_active_power_w",
     "smem_active_power_w",
+)
+DEFAULT_ENERGY_TRAINING_PER_CLASS = 12
+ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT = 20.0
+_ENERGY_CALIBRATION_CLASSES = (
+    "large",
+    "regular",
+    "skinny",
+    "small",
+    "small_k",
+    "vector_like",
 )
 
 
@@ -75,9 +84,6 @@ def calibrate_energy_from_artifact_database(
     fit_fraction: float = 0.7,
     limit: int | None = None,
 ) -> EnergyCalibrationResult:
-    if not 0.0 < fit_fraction < 1.0:
-        raise ValueError("fit_fraction must be in (0, 1)")
-
     hardware_path = _resolve_hardware_path(hardware_name, hardware_dir)
     hardware = load_hardware(hardware_path)
     samples, skip_counts = _artifact_gemm_samples(
@@ -88,42 +94,43 @@ def calibrate_energy_from_artifact_database(
     if len(samples) < 2:
         raise ValueError("At least two GEMM samples are required for fit and validation")
 
-    split_index = int(math.floor(len(samples) * fit_fraction))
-    split_index = min(max(split_index, 1), len(samples) - 1)
-    fit_samples = samples[:split_index]
-    validation_samples = samples[split_index:]
-
-    feature_rows, targets = _fit_matrix(fit_samples, hardware)
-    theta, *_ = np.linalg.lstsq(feature_rows, targets, rcond=None)
-    clipped_coefficients = tuple(
-        field
-        for field, value in zip(_POWER_COEFFICIENT_FIELDS, theta)
-        if float(value) < 0.0
+    fit_samples = _select_static_power_calibration_samples(
+        samples,
+        hardware=hardware,
+        training_per_class=DEFAULT_ENERGY_TRAINING_PER_CLASS,
     )
-    theta = np.maximum(theta, 0.0)
+    fit_keys = {_sample_key(sample) for sample in fit_samples}
+    validation_samples = tuple(
+        sample for sample in samples if _sample_key(sample) not in fit_keys
+    )
+    if not fit_samples or not validation_samples:
+        raise ValueError("Calibration requires both fit and validation rows")
+
+    base_power_w = _fit_static_base_power_w(fit_samples, hardware)
     coefficients = EnergyModelPowerCoefficients(
-        base_power_w=float(theta[0]),
-        sm_resident_power_w=float(theta[1]),
-        tc_active_power_w=float(theta[2]),
-        dram_active_power_w=float(theta[3]),
-        l2_active_power_w=float(theta[4]),
-        smem_active_power_w=float(theta[5]),
+        base_power_w=base_power_w,
     )
 
     energy_model = EnergyModelSpec(
-        model_level="E3",
+        model_level="E1",
         power_coefficients=coefficients,
-        feature_order=E3_POWER_FEATURE_ORDER,
+        feature_order=("time_kernel_s",),
         calibration={
             "source": "artifact_validation_database",
             "calibration_date": date.today().isoformat(),
-            "fit_fraction": fit_fraction,
+            "policy": "static_power_weighted_median",
+            "latency_ape_limit_pct": ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT,
+            "training_per_class": DEFAULT_ENERGY_TRAINING_PER_CLASS,
             "fit_rows": len(fit_samples),
             "validation_rows": len(validation_samples),
-            "clipped_coefficients": clipped_coefficients,
+            "calibration_rows": [
+                {"source_file": sample.source_file, "row_index": sample.row_index}
+                for sample in fit_samples
+            ],
+            "clipped_coefficients": (),
             "notes": (
                 "FLOP and byte event coefficients are fixed from hardware config; "
-                "least-squares fit calibrates only residual power attribution terms."
+                "weighted-median fit calibrates only static base power."
             ),
         },
     )
@@ -143,7 +150,7 @@ def calibrate_energy_from_artifact_database(
         validation_metrics_by_level=validation_metrics,
         fit_rows=len(fit_samples),
         validation_rows=len(validation_samples),
-        clipped_coefficients=clipped_coefficients,
+        clipped_coefficients=(),
         skip_counts=skip_counts,
     )
 
@@ -261,20 +268,107 @@ def _artifact_gemm_samples(
     return tuple(samples), skip_counts
 
 
-def _fit_matrix(
+def _select_static_power_calibration_samples(
     samples: tuple[ArtifactSample, ...],
+    *,
     hardware: HardwareSpec,
-) -> tuple[np.ndarray, np.ndarray]:
+    training_per_class: int,
+) -> tuple[ArtifactSample, ...]:
     model = create_model("extended_roofline")
     uncalibrated_hardware = replace(hardware, energy_model=None)
-    feature_rows: list[tuple[float, ...]] = []
-    targets: list[float] = []
+    rows: list[tuple[ArtifactSample, float, str]] = []
+    for sample in samples:
+        if sample.measured_energy_j <= 0.0 or sample.measured_latency_ms <= 0.0:
+            continue
+        profile = model.predict(sample.op, uncalibrated_hardware)
+        latency_ape_pct = abs(
+            profile.latency_s * 1000.0 / sample.measured_latency_ms - 1.0
+        ) * 100.0
+        if latency_ape_pct >= ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT:
+            continue
+        rows.append((sample, sample.measured_energy_j, _sample_class(sample)))
+
+    selected: list[ArtifactSample] = []
+    for kernel_class in _ENERGY_CALIBRATION_CLASSES:
+        class_rows = sorted(
+            (row for row in rows if row[2] == kernel_class),
+            key=lambda row: (row[1], _sample_key(row[0])),
+        )
+        selected.extend(
+            sample
+            for sample, _measured_energy_j in _stratified_by_measured_energy(
+                [(sample, measured_energy_j) for sample, measured_energy_j, _ in class_rows],
+                count=min(training_per_class, len(class_rows)),
+            )
+        )
+    return tuple(sorted(selected, key=_sample_key))
+
+
+def _stratified_by_measured_energy(
+    rows: list[tuple[ArtifactSample, float]],
+    *,
+    count: int,
+) -> tuple[tuple[ArtifactSample, float], ...]:
+    if count <= 0 or not rows:
+        return ()
+    if count >= len(rows):
+        return tuple(rows)
+    selected: list[tuple[ArtifactSample, float]] = []
+    used: set[tuple[str, int]] = set()
+    for index in range(count):
+        candidate_index = round(index * (len(rows) - 1) / max(1, count - 1))
+        candidate = rows[candidate_index]
+        if _sample_key(candidate[0]) in used:
+            candidate = next(row for row in rows if _sample_key(row[0]) not in used)
+        selected.append(candidate)
+        used.add(_sample_key(candidate[0]))
+    return tuple(selected)
+
+
+def _fit_static_base_power_w(
+    samples: tuple[ArtifactSample, ...],
+    hardware: HardwareSpec,
+) -> float:
+    model = create_model("extended_roofline")
+    uncalibrated_hardware = replace(hardware, energy_model=None)
+    weighted_targets: list[tuple[float, float]] = []
     for sample in samples:
         profile = model.predict(sample.op, uncalibrated_hardware)
         features = extract_gemm_e3_features(profile)
-        feature_rows.append(features.power_vector())
-        targets.append(sample.measured_energy_j - fixed_event_energy_j(profile))
-    return np.asarray(feature_rows, dtype=float), np.asarray(targets, dtype=float)
+        if features.time_kernel_s <= 0.0 or sample.measured_energy_j <= 0.0:
+            continue
+        residual_j = sample.measured_energy_j - fixed_event_energy_j(profile)
+        target_power_w = residual_j / features.time_kernel_s
+        weight = features.time_kernel_s / sample.measured_energy_j
+        weighted_targets.append((target_power_w, weight))
+    return max(0.0, _weighted_median(weighted_targets))
+
+
+def _weighted_median(values: list[tuple[float, float]]) -> float:
+    if not values:
+        return 0.0
+    total_weight = sum(max(0.0, weight) for _value, weight in values)
+    if total_weight <= 0.0:
+        return 0.0
+    midpoint = total_weight / 2.0
+    running = 0.0
+    for value, weight in sorted(values):
+        running += max(0.0, weight)
+        if running >= midpoint:
+            return float(value)
+    return float(sorted(values)[-1][0])
+
+
+def _sample_class(sample: ArtifactSample) -> str:
+    batch = int(sample.dimensions["batch"])
+    dim_m = int(sample.dimensions["M"])
+    dim_n = int(sample.dimensions["N"])
+    dim_k = int(sample.dimensions["K"])
+    return classify_gemm_size(batch=batch, dim_m=dim_m, dim_n=dim_n, dim_k=dim_k)
+
+
+def _sample_key(sample: ArtifactSample) -> tuple[str, int]:
+    return sample.source_file, sample.row_index
 
 
 def _metrics_by_level(

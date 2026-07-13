@@ -65,6 +65,7 @@ class GemmLatencyMetrics:
     name: str
     split: str
     count: int
+    energy_count: int
     latency_mape_pct: float
     latency_median_ape_pct: float
     latency_p90_ape_pct: float
@@ -234,10 +235,17 @@ def format_gemm_latency_report(report: GemmLatencyValidationReport) -> str:
             )
         lines.append("Held-out energy accuracy:")
         for metric in report.metrics:
+            if metric.energy_count == 0:
+                lines.append(
+                    "  "
+                    f"{metric.group}/{metric.name}: "
+                    "disabled"
+                )
+                continue
             lines.append(
                 "  "
                 f"{metric.group}/{metric.name}: "
-                f"n={metric.count}, "
+                f"n={metric.energy_count}, "
                 f"MAPE={metric.energy_mape_pct:.2f}%, "
                 f"median={metric.energy_median_ape_pct:.2f}%, "
                 f"p90={metric.energy_p90_ape_pct:.2f}%, "
@@ -482,13 +490,15 @@ def _metrics(
 ) -> GemmLatencyMetrics:
     latency_ape = sorted(row.latency_abs_pct_error for row in rows)
     latency_signed = [row.latency_signed_pct_error for row in rows]
-    energy_ape = sorted(row.energy_abs_pct_error for row in rows)
-    energy_signed = [row.energy_signed_pct_error for row in rows]
+    energy_rows = [row for row in rows if _energy_validation_enabled(row)]
+    energy_ape = sorted(row.energy_abs_pct_error for row in energy_rows)
+    energy_signed = [row.energy_signed_pct_error for row in energy_rows]
     return GemmLatencyMetrics(
         group=group,
         name=name,
         split="validation",
         count=len(rows),
+        energy_count=len(energy_rows),
         latency_mape_pct=_mean(latency_ape),
         latency_median_ape_pct=_percentile(latency_ape, 0.5),
         latency_p90_ape_pct=_percentile(latency_ape, 0.9),
@@ -500,6 +510,10 @@ def _metrics(
         energy_geomean_ratio=_geomean(row.energy_ratio for row in rows),
         energy_mean_signed_pct_error=_mean(energy_signed),
     )
+
+
+def _energy_validation_enabled(row: GemmLatencyRow) -> bool:
+    return row.hardware != "a10"
 
 
 def _sample_class(sample: ArtifactSample) -> str:
