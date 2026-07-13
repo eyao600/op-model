@@ -48,9 +48,9 @@ _POWER_COEFFICIENT_FIELDS = (
     "l2_active_power_w",
     "smem_active_power_w",
 )
-DEFAULT_ENERGY_TRAINING_PER_CLASS = 5
-ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT = 18.0
-ENERGY_CALIBRATION_QUANTILE_OFFSET = 0.05
+DEFAULT_ENERGY_TRAINING_PER_CLASS = 6
+ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT = 25.0
+ENERGY_CALIBRATION_QUANTILE_OFFSET = 0.1
 ENERGY_CALIBRATION_RIDGE = 1e-4
 STATIC_POWER_PRIOR_TRAINING_PER_CLASS = 2
 STATIC_POWER_PRIOR_LATENCY_APE_LIMIT_PCT = 25.0
@@ -138,7 +138,7 @@ def calibrate_energy_from_artifact_database(
         training_per_class=DEFAULT_ENERGY_TRAINING_PER_CLASS,
         latency_ape_limit_pct=ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT,
         quantile_offset=ENERGY_CALIBRATION_QUANTILE_OFFSET,
-        stratification="flops",
+        stratification="measured_energy",
     )
     fit_keys = {_sample_key(sample) for sample in fit_samples}
     validation_samples = tuple(
@@ -163,7 +163,7 @@ def calibrate_energy_from_artifact_database(
             "policy": "static_plus_dram_active_power_nnls_log_flops",
             "latency_ape_limit_pct": ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT,
             "training_per_class": DEFAULT_ENERGY_TRAINING_PER_CLASS,
-            "stratification": "log_flops",
+            "stratification": "measured_energy",
             "quantile_offset": ENERGY_CALIBRATION_QUANTILE_OFFSET,
             "static_prior_policy": {
                 "training_per_class": STATIC_POWER_PRIOR_TRAINING_PER_CLASS,
