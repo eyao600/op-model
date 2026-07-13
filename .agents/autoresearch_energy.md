@@ -33,6 +33,9 @@ During experiments, code and model changes are limited to:
 - `src/opmodel/calibration.py`
 - `src/opmodel/hardware.py`, only when a proposed model needs additional named
   nonnegative power coefficients in `EnergyModelPowerCoefficients`
+- `src/opmodel/models/extended_roofline.py`, only for memory-traffic accounting
+  formulas that are grounded in exposed kernel/hardware metadata or documented
+  GPU/CUTLASS behavior, and only when timing behavior is unchanged
 
 The agent may create or append untracked local research artifacts:
 
@@ -49,7 +52,8 @@ Do not modify:
 
 - hardware YAMLs to store fitted coefficients or calibration metadata
 - `src/opmodel/validation/gemm_latency.py`
-- `src/opmodel/models/extended_roofline.py`
+- `src/opmodel/models/extended_roofline.py`, except for the allowed
+  evidence-grounded memory-traffic accounting formulas above
 - FLOP energy coefficients in `compute.*_energy_j_per_flop`
 - byte-event coefficients in `memory.levels[*].energy_j_per_byte`
 - timing-model behavior or latency-calibration behavior
@@ -95,6 +99,8 @@ Guardrails:
 - do not significantly regress any kernel class for a small aggregate gain
 - reject shape-regime heuristics unless backed by real exposed kernel or
   hardware metadata
+- reject memory-traffic formula changes that are not backed by diagnostics,
+  kernel metadata, hardware metadata, or documented GPU/CUTLASS behavior
 - reject changes that make validation more than 5x slower
 - reject changes that hide fitted values in tracked config or source files
 
@@ -162,7 +168,8 @@ For each iteration:
 
 1. Inspect the latest validation metrics and identify the highest-error class.
 2. Form one energy-model hypothesis about residual/static power composition or
-   feature-to-energy mapping.
+   feature-to-energy mapping, or about evidence-grounded memory-traffic
+   accounting.
 3. Modify only the allowed code files.
 4. Fit nonnegative residual/static power coefficients on the calibration rows.
 5. Evaluate on all non-calibration rows with the existing validation harness.
