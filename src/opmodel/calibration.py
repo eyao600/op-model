@@ -31,7 +31,13 @@ from opmodel.validation.artifact_accuracy import (
     _sample_from_row,
     _supported_op_kind,
 )
-from opmodel.validation.gemm_latency import classify_gemm_size
+from opmodel.validation.gemm_latency import (
+    DEFAULT_TRAINING_PER_CLASS as GEMM_OVERHEAD_TRAINING_PER_CLASS,
+    _estimate_fixed_overhead_cycles,
+    _select_training_samples as _select_latency_overhead_training_samples,
+    _with_fixed_overhead,
+    classify_gemm_size,
+)
 
 
 _POWER_COEFFICIENT_FIELDS = (
@@ -42,8 +48,9 @@ _POWER_COEFFICIENT_FIELDS = (
     "l2_active_power_w",
     "smem_active_power_w",
 )
-DEFAULT_ENERGY_TRAINING_PER_CLASS = 12
-ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT = 20.0
+DEFAULT_ENERGY_TRAINING_PER_CLASS = 2
+ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT = 25.0
+ENERGY_CALIBRATION_QUANTILE_OFFSET = 0.25
 _ENERGY_CALIBRATION_CLASSES = (
     "large",
     "regular",
@@ -94,19 +101,38 @@ def calibrate_energy_from_artifact_database(
     if len(samples) < 2:
         raise ValueError("At least two GEMM samples are required for fit and validation")
 
-    fit_samples = _select_static_power_calibration_samples(
+    fixed_overhead_training_samples = _select_latency_overhead_training_samples(
         samples,
+        training_per_class=GEMM_OVERHEAD_TRAINING_PER_CLASS,
+    )
+    fixed_overhead_cycles = _estimate_fixed_overhead_cycles(
+        samples=fixed_overhead_training_samples,
         hardware=hardware,
+        model=create_model("extended_roofline"),
+    )
+    profiled_hardware = _with_fixed_overhead(hardware, fixed_overhead_cycles)
+    fixed_overhead_training_keys = {
+        _sample_key(sample) for sample in fixed_overhead_training_samples
+    }
+    energy_samples = tuple(
+        sample
+        for sample in samples
+        if _sample_key(sample) not in fixed_overhead_training_keys
+    )
+
+    fit_samples = _select_static_power_calibration_samples(
+        energy_samples,
+        hardware=profiled_hardware,
         training_per_class=DEFAULT_ENERGY_TRAINING_PER_CLASS,
     )
     fit_keys = {_sample_key(sample) for sample in fit_samples}
     validation_samples = tuple(
-        sample for sample in samples if _sample_key(sample) not in fit_keys
+        sample for sample in energy_samples if _sample_key(sample) not in fit_keys
     )
     if not fit_samples or not validation_samples:
         raise ValueError("Calibration requires both fit and validation rows")
 
-    base_power_w = _fit_static_base_power_w(fit_samples, hardware)
+    base_power_w = _fit_static_base_power_w(fit_samples, profiled_hardware)
     coefficients = EnergyModelPowerCoefficients(
         base_power_w=base_power_w,
     )
@@ -121,6 +147,8 @@ def calibrate_energy_from_artifact_database(
             "policy": "static_power_weighted_median",
             "latency_ape_limit_pct": ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT,
             "training_per_class": DEFAULT_ENERGY_TRAINING_PER_CLASS,
+            "base_fixed_overhead_cycles": hardware.compute.device_fixed_overhead_cycles,
+            "calibrated_fixed_overhead_cycles": fixed_overhead_cycles,
             "fit_rows": len(fit_samples),
             "validation_rows": len(validation_samples),
             "calibration_rows": [
@@ -134,7 +162,7 @@ def calibrate_energy_from_artifact_database(
             ),
         },
     )
-    calibrated_hardware = replace(hardware, energy_model=energy_model)
+    calibrated_hardware = replace(profiled_hardware, energy_model=energy_model)
     fit_metrics = _metrics_by_level(fit_samples, calibrated_hardware)
     validation_metrics = _metrics_by_level(validation_samples, calibrated_hardware)
 
@@ -316,7 +344,13 @@ def _stratified_by_measured_energy(
     selected: list[tuple[ArtifactSample, float]] = []
     used: set[tuple[str, int]] = set()
     for index in range(count):
-        candidate_index = round(index * (len(rows) - 1) / max(1, count - 1))
+        quantile = (
+            (index + ENERGY_CALIBRATION_QUANTILE_OFFSET)
+            / max(1.0, count - 1 + 2 * ENERGY_CALIBRATION_QUANTILE_OFFSET)
+            if count > 1
+            else 0.5
+        )
+        candidate_index = round(quantile * (len(rows) - 1))
         candidate = rows[candidate_index]
         if _sample_key(candidate[0]) in used:
             candidate = next(row for row in rows if _sample_key(row[0]) not in used)
