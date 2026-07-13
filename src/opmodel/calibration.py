@@ -48,9 +48,13 @@ _POWER_COEFFICIENT_FIELDS = (
     "l2_active_power_w",
     "smem_active_power_w",
 )
-DEFAULT_ENERGY_TRAINING_PER_CLASS = 2
-ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT = 25.0
-ENERGY_CALIBRATION_QUANTILE_OFFSET = 0.25
+DEFAULT_ENERGY_TRAINING_PER_CLASS = 5
+ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT = 18.0
+ENERGY_CALIBRATION_QUANTILE_OFFSET = 0.05
+ENERGY_CALIBRATION_RIDGE = 1e-4
+STATIC_POWER_PRIOR_TRAINING_PER_CLASS = 2
+STATIC_POWER_PRIOR_LATENCY_APE_LIMIT_PCT = 25.0
+STATIC_POWER_PRIOR_QUANTILE_OFFSET = 0.25
 _ENERGY_CALIBRATION_CLASSES = (
     "large",
     "regular",
@@ -120,10 +124,21 @@ def calibrate_energy_from_artifact_database(
         if _sample_key(sample) not in fixed_overhead_training_keys
     )
 
+    static_prior_samples = _select_static_power_calibration_samples(
+        energy_samples,
+        hardware=profiled_hardware,
+        training_per_class=STATIC_POWER_PRIOR_TRAINING_PER_CLASS,
+        latency_ape_limit_pct=STATIC_POWER_PRIOR_LATENCY_APE_LIMIT_PCT,
+        quantile_offset=STATIC_POWER_PRIOR_QUANTILE_OFFSET,
+        stratification="measured_energy",
+    )
     fit_samples = _select_static_power_calibration_samples(
         energy_samples,
         hardware=profiled_hardware,
         training_per_class=DEFAULT_ENERGY_TRAINING_PER_CLASS,
+        latency_ape_limit_pct=ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT,
+        quantile_offset=ENERGY_CALIBRATION_QUANTILE_OFFSET,
+        stratification="flops",
     )
     fit_keys = {_sample_key(sample) for sample in fit_samples}
     validation_samples = tuple(
@@ -132,21 +147,33 @@ def calibrate_energy_from_artifact_database(
     if not fit_samples or not validation_samples:
         raise ValueError("Calibration requires both fit and validation rows")
 
-    base_power_w = _fit_static_base_power_w(fit_samples, profiled_hardware)
-    coefficients = EnergyModelPowerCoefficients(
-        base_power_w=base_power_w,
+    coefficients = _fit_static_dram_power_coefficients(
+        fit_samples,
+        profiled_hardware,
+        static_prior_samples=static_prior_samples,
     )
 
     energy_model = EnergyModelSpec(
-        model_level="E1",
+        model_level="E3",
         power_coefficients=coefficients,
-        feature_order=("time_kernel_s",),
+        feature_order=("time_kernel_s", "time_dram_active_s"),
         calibration={
             "source": "artifact_validation_database",
             "calibration_date": date.today().isoformat(),
-            "policy": "static_power_weighted_median",
+            "policy": "static_plus_dram_active_power_nnls_log_flops",
             "latency_ape_limit_pct": ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT,
             "training_per_class": DEFAULT_ENERGY_TRAINING_PER_CLASS,
+            "stratification": "log_flops",
+            "quantile_offset": ENERGY_CALIBRATION_QUANTILE_OFFSET,
+            "static_prior_policy": {
+                "training_per_class": STATIC_POWER_PRIOR_TRAINING_PER_CLASS,
+                "latency_ape_limit_pct": STATIC_POWER_PRIOR_LATENCY_APE_LIMIT_PCT,
+                "stratification": "measured_energy",
+                "quantile_offset": STATIC_POWER_PRIOR_QUANTILE_OFFSET,
+            },
+            "regression": "nonnegative_least_squares",
+            "weighting": "sqrt_measured_energy_inverse",
+            "ridge_to_static_prior": ENERGY_CALIBRATION_RIDGE,
             "base_fixed_overhead_cycles": hardware.compute.device_fixed_overhead_cycles,
             "calibrated_fixed_overhead_cycles": fixed_overhead_cycles,
             "fit_rows": len(fit_samples),
@@ -155,10 +182,15 @@ def calibrate_energy_from_artifact_database(
                 {"source_file": sample.source_file, "row_index": sample.row_index}
                 for sample in fit_samples
             ],
+            "static_prior_rows": [
+                {"source_file": sample.source_file, "row_index": sample.row_index}
+                for sample in static_prior_samples
+            ],
             "clipped_coefficients": (),
             "notes": (
                 "FLOP and byte event coefficients are fixed from hardware config; "
-                "weighted-median fit calibrates only static base power."
+                "nonnegative regression calibrates only residual base and "
+                "DRAM-active power terms."
             ),
         },
     )
@@ -301,6 +333,9 @@ def _select_static_power_calibration_samples(
     *,
     hardware: HardwareSpec,
     training_per_class: int,
+    latency_ape_limit_pct: float,
+    quantile_offset: float,
+    stratification: str,
 ) -> tuple[ArtifactSample, ...]:
     model = create_model("extended_roofline")
     uncalibrated_hardware = replace(hardware, energy_model=None)
@@ -312,9 +347,14 @@ def _select_static_power_calibration_samples(
         latency_ape_pct = abs(
             profile.latency_s * 1000.0 / sample.measured_latency_ms - 1.0
         ) * 100.0
-        if latency_ape_pct >= ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT:
+        if latency_ape_pct >= latency_ape_limit_pct:
             continue
-        rows.append((sample, sample.measured_energy_j, _sample_class(sample)))
+        scale = (
+            sample.measured_energy_j
+            if stratification == "measured_energy"
+            else max(1.0, float(profile.flops))
+        )
+        rows.append((sample, scale, _sample_class(sample)))
 
     selected: list[ArtifactSample] = []
     for kernel_class in _ENERGY_CALIBRATION_CLASSES:
@@ -324,18 +364,20 @@ def _select_static_power_calibration_samples(
         )
         selected.extend(
             sample
-            for sample, _measured_energy_j in _stratified_by_measured_energy(
-                [(sample, measured_energy_j) for sample, measured_energy_j, _ in class_rows],
+            for sample, _scale in _stratified_by_scale(
+                [(sample, scale) for sample, scale, _ in class_rows],
                 count=min(training_per_class, len(class_rows)),
+                quantile_offset=quantile_offset,
             )
         )
     return tuple(sorted(selected, key=_sample_key))
 
 
-def _stratified_by_measured_energy(
+def _stratified_by_scale(
     rows: list[tuple[ArtifactSample, float]],
     *,
     count: int,
+    quantile_offset: float,
 ) -> tuple[tuple[ArtifactSample, float], ...]:
     if count <= 0 or not rows:
         return ()
@@ -345,8 +387,8 @@ def _stratified_by_measured_energy(
     used: set[tuple[str, int]] = set()
     for index in range(count):
         quantile = (
-            (index + ENERGY_CALIBRATION_QUANTILE_OFFSET)
-            / max(1.0, count - 1 + 2 * ENERGY_CALIBRATION_QUANTILE_OFFSET)
+            (index + quantile_offset)
+            / max(1.0, count - 1 + 2 * quantile_offset)
             if count > 1
             else 0.5
         )
@@ -359,23 +401,148 @@ def _stratified_by_measured_energy(
     return tuple(selected)
 
 
-def _fit_static_base_power_w(
+def _fit_static_dram_power_coefficients(
     samples: tuple[ArtifactSample, ...],
     hardware: HardwareSpec,
-) -> float:
+    *,
+    static_prior_samples: tuple[ArtifactSample, ...],
+) -> EnergyModelPowerCoefficients:
+    rows = _power_fit_rows(samples, hardware)
+    static_prior_rows = _power_fit_rows(static_prior_samples, hardware)
+    base_power_w, dram_active_power_w = _fit_nonnegative_two_feature_power(
+        rows,
+        prior=(
+            _weighted_static_power_prior(static_prior_rows),
+            0.0,
+        ),
+    )
+    return EnergyModelPowerCoefficients(
+        base_power_w=base_power_w,
+        dram_active_power_w=dram_active_power_w,
+    )
+
+
+def _power_fit_rows(
+    samples: tuple[ArtifactSample, ...],
+    hardware: HardwareSpec,
+) -> list[tuple[float, float, float, float]]:
     model = create_model("extended_roofline")
     uncalibrated_hardware = replace(hardware, energy_model=None)
-    weighted_targets: list[tuple[float, float]] = []
+    rows: list[tuple[float, float, float, float]] = []
     for sample in samples:
         profile = model.predict(sample.op, uncalibrated_hardware)
         features = extract_gemm_e3_features(profile)
         if features.time_kernel_s <= 0.0 or sample.measured_energy_j <= 0.0:
             continue
         residual_j = sample.measured_energy_j - fixed_event_energy_j(profile)
-        target_power_w = residual_j / features.time_kernel_s
-        weight = features.time_kernel_s / sample.measured_energy_j
-        weighted_targets.append((target_power_w, weight))
+        rows.append(
+            (
+                features.time_kernel_s,
+                features.time_dram_active_s,
+                residual_j,
+                sample.measured_energy_j,
+            )
+        )
+    return rows
+
+
+def _weighted_static_power_prior(
+    rows: list[tuple[float, float, float, float]],
+) -> float:
+    weighted_targets = [
+        (residual_j / time_kernel_s, time_kernel_s / measured_energy_j)
+        for time_kernel_s, _time_dram_active_s, residual_j, measured_energy_j in rows
+        if time_kernel_s > 0.0 and measured_energy_j > 0.0
+    ]
     return max(0.0, _weighted_median(weighted_targets))
+
+
+def _fit_nonnegative_two_feature_power(
+    rows: list[tuple[float, float, float, float]],
+    *,
+    prior: tuple[float, float],
+) -> tuple[float, float]:
+    if not rows:
+        return 0.0, 0.0
+    best: tuple[float, tuple[float, float]] | None = None
+    active_sets = ((0, 1), (0,), (1,), ())
+    for active in active_sets:
+        coefficients = [0.0, 0.0]
+        if active:
+            matrix, rhs = _normal_equations_for_active_features(
+                rows,
+                active=active,
+                prior=prior,
+            )
+            solution = _solve_2x2_or_1x1(matrix, rhs)
+            if any(value < -1e-9 for value in solution):
+                continue
+            for index, value in zip(active, solution):
+                coefficients[index] = max(0.0, float(value))
+        objective = _regularized_weighted_sse(rows, tuple(coefficients), prior)
+        if best is None or objective < best[0]:
+            best = (objective, (coefficients[0], coefficients[1]))
+    return best[1] if best is not None else (0.0, 0.0)
+
+
+def _normal_equations_for_active_features(
+    rows: list[tuple[float, float, float, float]],
+    *,
+    active: tuple[int, ...],
+    prior: tuple[float, float],
+) -> tuple[list[list[float]], list[float]]:
+    matrix = [[0.0 for _ in active] for _ in active]
+    rhs = [0.0 for _ in active]
+    for time_kernel_s, time_dram_active_s, residual_j, measured_energy_j in rows:
+        weight = 1.0 / math.sqrt(measured_energy_j)
+        features = (time_kernel_s, time_dram_active_s)
+        for row_index, feature_index in enumerate(active):
+            weighted_feature = features[feature_index] * weight
+            rhs[row_index] += weighted_feature * residual_j * weight
+            for col_index, other_feature_index in enumerate(active):
+                matrix[row_index][col_index] += (
+                    weighted_feature * features[other_feature_index] * weight
+                )
+    for index, feature_index in enumerate(active):
+        matrix[index][index] += ENERGY_CALIBRATION_RIDGE
+        rhs[index] += ENERGY_CALIBRATION_RIDGE * prior[feature_index]
+    return matrix, rhs
+
+
+def _solve_2x2_or_1x1(matrix: list[list[float]], rhs: list[float]) -> tuple[float, ...]:
+    if len(rhs) == 0:
+        return ()
+    if len(rhs) == 1:
+        denominator = matrix[0][0]
+        return (rhs[0] / denominator if denominator else 0.0,)
+    a, b = matrix[0]
+    c, d = matrix[1]
+    determinant = a * d - b * c
+    if abs(determinant) <= 1e-30:
+        return (0.0, 0.0)
+    return (
+        (rhs[0] * d - b * rhs[1]) / determinant,
+        (a * rhs[1] - rhs[0] * c) / determinant,
+    )
+
+
+def _regularized_weighted_sse(
+    rows: list[tuple[float, float, float, float]],
+    coefficients: tuple[float, float],
+    prior: tuple[float, float],
+) -> float:
+    total = ENERGY_CALIBRATION_RIDGE * sum(
+        (coefficient - prior_value) ** 2
+        for coefficient, prior_value in zip(coefficients, prior)
+    )
+    for time_kernel_s, time_dram_active_s, residual_j, measured_energy_j in rows:
+        weight = 1.0 / math.sqrt(measured_energy_j)
+        predicted = (
+            time_kernel_s * coefficients[0]
+            + time_dram_active_s * coefficients[1]
+        )
+        total += ((predicted - residual_j) * weight) ** 2
+    return total
 
 
 def _weighted_median(values: list[tuple[float, float]]) -> float:
