@@ -2717,6 +2717,7 @@ def _tensor_latency_cycles(
     default = {
         (16, 8, 8): 17.5,
         (16, 8, 16): 26.0,
+        (16, 16, 16): 26.0,
     }.get((kernel.mma_m, kernel.mma_n, kernel.mma_k), 8.0)
     _append_warning_once(warnings, f"tensor_latency_cycles_default_{default:g}")
     return default
