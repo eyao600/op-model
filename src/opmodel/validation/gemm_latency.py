@@ -46,6 +46,11 @@ class GemmLatencyRow:
     latency_ratio: float
     latency_abs_pct_error: float
     latency_signed_pct_error: float
+    measured_energy_j: float
+    predicted_energy_j: float
+    energy_ratio: float
+    energy_abs_pct_error: float
+    energy_signed_pct_error: float
     fixed_overhead_cycles: int
     modeled_device_cycles: float | None
     total_device_cycles: float | None
@@ -65,6 +70,11 @@ class GemmLatencyMetrics:
     latency_p90_ape_pct: float
     latency_geomean_ratio: float
     latency_mean_signed_pct_error: float
+    energy_mape_pct: float
+    energy_median_ape_pct: float
+    energy_p90_ape_pct: float
+    energy_geomean_ratio: float
+    energy_mean_signed_pct_error: float
 
 
 @dataclass(frozen=True)
@@ -221,6 +231,18 @@ def format_gemm_latency_report(report: GemmLatencyValidationReport) -> str:
                 f"p90={metric.latency_p90_ape_pct:.2f}%, "
                 f"ratio={metric.latency_geomean_ratio:.3g}, "
                 f"signed={metric.latency_mean_signed_pct_error:.2f}%"
+            )
+        lines.append("Held-out energy accuracy:")
+        for metric in report.metrics:
+            lines.append(
+                "  "
+                f"{metric.group}/{metric.name}: "
+                f"n={metric.count}, "
+                f"MAPE={metric.energy_mape_pct:.2f}%, "
+                f"median={metric.energy_median_ape_pct:.2f}%, "
+                f"p90={metric.energy_p90_ape_pct:.2f}%, "
+                f"ratio={metric.energy_geomean_ratio:.3g}, "
+                f"signed={metric.energy_mean_signed_pct_error:.2f}%"
             )
     else:
         lines.append("No held-out validation rows were processed.")
@@ -396,7 +418,9 @@ def _predict_row(
 ) -> GemmLatencyRow:
     profile = model.predict(sample.op, hardware)
     predicted_latency_ms = profile.latency_s * 1000.0
+    predicted_energy_j = profile.energy_j
     latency_ratio = predicted_latency_ms / sample.measured_latency_ms
+    energy_ratio = predicted_energy_j / sample.measured_energy_j
     dims = _sample_dims(sample)
     diagnostics = profile.diagnostics
     return GemmLatencyRow(
@@ -420,6 +444,11 @@ def _predict_row(
         latency_ratio=latency_ratio,
         latency_abs_pct_error=abs(latency_ratio - 1.0) * 100.0,
         latency_signed_pct_error=(latency_ratio - 1.0) * 100.0,
+        measured_energy_j=sample.measured_energy_j,
+        predicted_energy_j=predicted_energy_j,
+        energy_ratio=energy_ratio,
+        energy_abs_pct_error=abs(energy_ratio - 1.0) * 100.0,
+        energy_signed_pct_error=(energy_ratio - 1.0) * 100.0,
         fixed_overhead_cycles=int(hardware.compute.device_fixed_overhead_cycles or 0),
         modeled_device_cycles=_optional_float(diagnostics.get("modeled_device_cycles")),
         total_device_cycles=_optional_float(diagnostics.get("total_device_cycles")),
@@ -451,18 +480,25 @@ def _metrics(
     name: str,
     rows: list[GemmLatencyRow],
 ) -> GemmLatencyMetrics:
-    ape = sorted(row.latency_abs_pct_error for row in rows)
-    signed = [row.latency_signed_pct_error for row in rows]
+    latency_ape = sorted(row.latency_abs_pct_error for row in rows)
+    latency_signed = [row.latency_signed_pct_error for row in rows]
+    energy_ape = sorted(row.energy_abs_pct_error for row in rows)
+    energy_signed = [row.energy_signed_pct_error for row in rows]
     return GemmLatencyMetrics(
         group=group,
         name=name,
         split="validation",
         count=len(rows),
-        latency_mape_pct=_mean(ape),
-        latency_median_ape_pct=_percentile(ape, 0.5),
-        latency_p90_ape_pct=_percentile(ape, 0.9),
+        latency_mape_pct=_mean(latency_ape),
+        latency_median_ape_pct=_percentile(latency_ape, 0.5),
+        latency_p90_ape_pct=_percentile(latency_ape, 0.9),
         latency_geomean_ratio=_geomean(row.latency_ratio for row in rows),
-        latency_mean_signed_pct_error=_mean(signed),
+        latency_mean_signed_pct_error=_mean(latency_signed),
+        energy_mape_pct=_mean(energy_ape),
+        energy_median_ape_pct=_percentile(energy_ape, 0.5),
+        energy_p90_ape_pct=_percentile(energy_ape, 0.9),
+        energy_geomean_ratio=_geomean(row.energy_ratio for row in rows),
+        energy_mean_signed_pct_error=_mean(energy_signed),
     )
 
 
@@ -590,6 +626,11 @@ _CSV_FIELDS = (
     "latency_ratio",
     "latency_abs_pct_error",
     "latency_signed_pct_error",
+    "measured_energy_j",
+    "predicted_energy_j",
+    "energy_ratio",
+    "energy_abs_pct_error",
+    "energy_signed_pct_error",
     "fixed_overhead_cycles",
     "modeled_device_cycles",
     "total_device_cycles",

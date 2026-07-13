@@ -12,6 +12,8 @@ compute:
   # Calibrated from median small/small-skinny GEMM residuals at 900 MHz.
   device_fixed_overhead_cycles: 15000
   num_sms: 72
+  # NVIDIA Ampere CC 8.6 supports up to 100 KiB shared memory per SM.
+  shared_memory_bytes_per_sm: 102400
   fma_dims: [16, 8, 16]
   dataflow: output_stationary
   vector_flops_per_s:
@@ -35,6 +37,14 @@ memory:
       size_bytes: 6291456
       bandwidth_bytes_per_s: 4.608e12
       energy_j_per_byte: 3.2552083333333334e-11
+    - name: sram
+      # 100 KiB/SM * 72 SMs. Bandwidth is inferred from 32 shared-memory
+      # banks * 4 B/bank/cycle/SM at the 900 MHz modeled clock.
+      size_bytes: 7372800
+      bandwidth_bytes_per_s: 8.2944e12
+      energy_j_per_byte: 1.272e-11
+      bank_count: 32
+      bank_width_bytes: 4
     - name: hbm
       size_bytes: 25769803776
       bandwidth_bytes_per_s: 6.0e11

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -64,7 +65,15 @@ def test_fixed_overhead_training_rows_are_held_out(tmp_path: Path) -> None:
     }
     assert report.fixed_overheads["a10"].calibrated_fixed_overhead_cycles >= 0
     assert all(metric.split == "validation" for metric in report.metrics)
-    assert next(metric for metric in report.metrics if metric.group == "all").count == 4
+    all_metric = next(metric for metric in report.metrics if metric.group == "all")
+    assert all_metric.count == 4
+    assert all_metric.energy_mape_pct >= 0.0
+    assert all_metric.energy_median_ape_pct >= 0.0
+    assert all_metric.energy_p90_ape_pct >= 0.0
+    assert all_metric.energy_geomean_ratio > 0.0
+    assert math.isfinite(all_metric.energy_mean_signed_pct_error)
+    assert all(row.measured_energy_j == 0.1 for row in report.rows)
+    assert all(row.predicted_energy_j >= 0.0 for row in report.rows)
 
 
 def test_no_calibration_uses_config_overhead(tmp_path: Path) -> None:
@@ -138,11 +147,20 @@ def test_cli_validate_gemm_latency_writes_outputs(tmp_path: Path) -> None:
     )
 
     assert "Held-out validation rows: 1" in result.stdout
+    assert "Held-out latency accuracy:" in result.stdout
+    assert "Held-out energy accuracy:" in result.stdout
     assert output_csv.exists()
     assert output_params.exists()
     with output_csv.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert {row["split"] for row in rows} == {"train", "validation"}
+    assert {
+        "measured_energy_j",
+        "predicted_energy_j",
+        "energy_ratio",
+        "energy_abs_pct_error",
+        "energy_signed_pct_error",
+    }.issubset(rows[0])
     params = json.loads(output_params.read_text(encoding="utf-8"))
     assert "a10" in params
     assert params["a10"]["training_rows"]
