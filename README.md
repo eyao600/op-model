@@ -75,6 +75,25 @@ and likely bottlenecks. Kernel parameters such as `cta_tile_m`, `cta_tile_n`,
 conservative defaults are used when they are omitted. Non-GEMM ops reuse the
 standard `roofline` estimators.
 
+The first-class `effective_roofline` model uses the same GEMM parsing, kernel
+catalog, traffic, occupancy, energy, and non-GEMM estimators, but replaces the
+detailed K-stage timeline with a constant-complexity phase-aware roofline:
+
+```bash
+opmodel predict \
+  --model effective_roofline \
+  --hardware src/opmodel/configs/hardware/a10.yaml \
+  --op examples/gemm_extended_roofline.yaml
+```
+
+For each full or tail CTA wave it derives concurrency-limited tensor, SMEM, L2,
+and HBM rates, overlaps the local and memory bodies, and retains explicit memory
+prologue and output-epilogue phases. Diagnostics include raw/effective rates,
+occupancy classes, exact SMSP warp distributions, memory windows, service and
+phase cycles, tied limiting resources, tile efficiency, and useful throughput.
+Automatic kernel selection evaluates its shortlist with the effective model;
+when `gemm_selection_backend` is set, its value must be `effective_roofline`.
+
 To validate the extended GEMM latency timeline against the local GEMM latency
 CSVs in `data/`:
 
@@ -82,11 +101,12 @@ CSVs in `data/`:
 opmodel validate-gemm-latency --data-dir data
 ```
 
-This command uses `extended_roofline`, loads hardware inputs from
-`src/opmodel/configs/hardware/`, and calibrates only fixed device overhead
-cycles. It selects a small deterministic set of `small` and `vector_like` GEMMs
-for overhead calibration, then reports held-out latency error for every other
-supported GEMM row overall, by hardware, and by GEMM size class. Use
+By default this command uses `extended_roofline` (pass
+`--model effective_roofline` to validate the effective-ceiling model), loads
+hardware inputs from `src/opmodel/configs/hardware/`, and calibrates only fixed
+device overhead cycles. It selects a small deterministic set of `small` and
+`vector_like` GEMMs for overhead calibration, then reports held-out latency
+error for every other supported GEMM row overall, by hardware, and by GEMM size class. Use
 `--no-calibrate-fixed-overhead` to report accuracy with the hardware config
 overhead as-is, `--output-csv` for per-row predictions, and `--output-params`
 for the resolved overhead inputs and training rows.

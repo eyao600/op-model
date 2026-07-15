@@ -12,3 +12,4 @@ validation_artifacts/*
 experiments/*
 tests/*
 !tests/test_gemm_latency_validation.py
+!tests/test_effective_roofline.py
