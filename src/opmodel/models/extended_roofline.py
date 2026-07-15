@@ -1345,7 +1345,7 @@ def _occupancy(
     wave_count = max(1, _ceil_div(grid.cta_count, ctas_per_wave))
     final_wave_ctas = grid.cta_count - (wave_count - 1) * ctas_per_wave
     tail_efficiency = final_wave_ctas / ctas_per_wave if ctas_per_wave else 1.0
-    lazy_ctas_per_sm, busy_remainder = divmod(final_wave_ctas, num_sms)
+    lazy_ctas_per_sm, busy_remainder = divmod(final_wave_ctas, num_sms) # blocks are dynamically assigned to eligible SMs, but let's just say blocks are dispatched in round robin for balanced occupancy
     busy_ctas_per_sm = lazy_ctas_per_sm + (1 if busy_remainder else 0)
     busy_sms = busy_remainder if busy_remainder else (num_sms if final_wave_ctas else 0)
     lazy_sms = num_sms - busy_sms
@@ -1635,10 +1635,10 @@ def _wave_pipeline(
         (effective_warp_m + effective_warp_n) * effective_warp_k * dtype_bytes
     )
     smsp_warps = _ceil_div(active_warps, 4) if active_warps else 0
-    exposed_shared_latency_cycles = shared_latency_cycles / max(1, smsp_warps)
+    # exposed_shared_latency_cycles = shared_latency_cycles / max(1, smsp_warps)
     smem_group_cycles = (
         max(active_warps * warptile_smem_to_reg_bytes / max(per_sm_smem_bw, 1.0e-12),
-            exposed_shared_latency_cycles)
+            shared_latency_cycles)
         if active_warps > 0
         else 0.0
     )
@@ -1743,7 +1743,7 @@ def _wave_pipeline(
     warptile_reg_to_smem_bytes = effective_warp_m * effective_warp_n * output_dtype_bytes
     epilogue_smem_cycles = (
         max(active_warps * warptile_reg_to_smem_bytes / max(per_sm_smem_bw, 1.0e-12),
-            exposed_shared_latency_cycles)
+            shared_latency_cycles)
         if active_warps > 0
         else 0.0
     )
@@ -1753,7 +1753,7 @@ def _wave_pipeline(
             active_warps
             * warptile_reg_to_smem_bytes
             / max(per_sm_smem_bw * kernel.num_warp_tile_k, 1.0e-12),
-            exposed_shared_latency_cycles,
+            shared_latency_cycles,
         )
         if kernel.slice_k and active_warps > 0
         else 0.0

@@ -9,6 +9,9 @@ static_power_w: 47.939551350932
 # derived from power_cap divided by the corresponding peak throughput.
 compute:
   clock_hz: 9.0e8
+  # Rounded from the 24.7-cycle completion latency of dense FP16
+  # mma.m16n8k16 on A100: https://ar5iv.labs.arxiv.org/html/2206.02874
+  tensor_latency_cycles: 26
   # Calibrated from median small/small-skinny GEMM residuals at 900 MHz.
   device_fixed_overhead_cycles: 22400
   num_sms: 108
@@ -42,6 +45,9 @@ memory:
     - name: l2
       size_bytes: 41943040
       bandwidth_bytes_per_s: 4.608e12
+      # 202.8-cycle A100 L2 near-hit latency, expressed at this config's
+      # 900 MHz modeled clock: https://arxiv.org/abs/2501.12084
+      latency_s: 2.2533333333333333e-7
       energy_j_per_byte: 3.768e-11 # 5.425347222222222e-11
       energy_j_per_sector: 3.68e-10 # Delestrac et al
     - name: sram
@@ -49,6 +55,9 @@ memory:
       # banks * 4 B/bank/cycle/SM at the 900 MHz modeled clock.
       size_bytes: 18137088
       bandwidth_bytes_per_s: 1.24416e13
+      # 29-cycle A100 shared-memory latency, expressed at this config's
+      # 900 MHz modeled clock: https://arxiv.org/abs/2501.12084
+      latency_s: 3.2222222222222224e-8
       energy_j_per_byte: 1.272e-11
       energy_j_per_sector: 8.21e-11 # Delestrac et al
       bank_count: 32
@@ -56,6 +65,9 @@ memory:
     - name: hbm
       size_bytes: 42949672960
       bandwidth_bytes_per_s: 1.555e12
+      # 566-cycle A100 global-memory latency, expressed at this config's
+      # 900 MHz modeled clock: https://arxiv.org/abs/2501.12084
+      latency_s: 6.288888888888889e-7
       energy_j_per_byte: 1.0488e-10 # 1.607717041800643e-10
       energy_j_per_sector: 2.09e-9 # Delestrac et al
 

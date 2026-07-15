@@ -28,6 +28,8 @@ _GEMM_WORKLOAD_BATCHES = (16, 32, 64, 128)
 _GEMM_WORKLOAD_MNKS = (256, 512, 1024, 2048)
 _SOFTMAX_WORKLOAD_BATCHES = tuple(2**power for power in range(13, 20))
 _SOFTMAX_WORKLOAD_DIMS = (512, 1024)
+# See NVIDIA CUTLASS’s TensorOp functionality table
+# https://docs.nvidia.com/cutlass/4.2.1/media/docs/cpp/functionality.html#warp-level-matrix-multiply-with-tensor-cores
 _TENSOROP_WARP_SHAPES = {
     "884": ((32, 32, 4), (32, 64, 4), (64, 32, 4), (64, 64, 4)),
     "1688": ((32, 32, 8), (32, 64, 8), (64, 32, 8), (64, 64, 8)),
