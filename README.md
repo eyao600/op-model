@@ -111,6 +111,19 @@ error for every other supported GEMM row overall, by hardware, and by GEMM size 
 overhead as-is, `--output-csv` for per-row predictions, and `--output-params`
 for the resolved overhead inputs and training rows.
 
+To compare the standard roofline baseline with both GEMM-specific models on the
+same held-out rows and fixed-overhead calibration split:
+
+```bash
+opmodel validate-gemm-latency --data-dir data --compare-rooflines
+```
+
+The comparison reports latency and energy MAPE, median error, p90 error, and
+geometric-mean prediction ratio overall, by hardware, and by GEMM size class.
+MAPE deltas are measured against the standard `roofline` model. Because that
+model does not natively consume `device_fixed_overhead_cycles`, the validation
+harness adds its calibrated overhead after evaluating the base roofline.
+
 To compare bf16 predictions against the EnergAIzer artifact data and write a
 normalized SVG scatter plot:
 

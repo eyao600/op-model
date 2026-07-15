@@ -24,7 +24,9 @@ from opmodel.validation.gemm_latency import (
     DEFAULT_GEMM_LATENCY_DATA_DIR,
     DEFAULT_TRAINING_PER_CLASS,
     format_gemm_latency_report,
+    format_gemm_roofline_comparison,
     run_gemm_latency_validation,
+    run_gemm_roofline_comparison,
     write_gemm_latency_csv,
     write_gemm_latency_params,
 )
@@ -58,6 +60,11 @@ def main(argv: list[str] | None = None) -> int:
     gemm_latency_parser.add_argument("--data-dir", default=str(DEFAULT_GEMM_LATENCY_DATA_DIR))
     gemm_latency_parser.add_argument("--hardware-dir", default=str(DEFAULT_HARDWARE_DIR))
     gemm_latency_parser.add_argument("--model", default="extended_roofline")
+    gemm_latency_parser.add_argument(
+        "--compare-rooflines",
+        action="store_true",
+        help="compare roofline, extended_roofline, and effective_roofline",
+    )
     gemm_latency_parser.add_argument(
         "--no-calibrate-fixed-overhead",
         action="store_true",
@@ -116,6 +123,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Wrote normalized plot: {plot_path}")
         return 0
     if args.command == "validate-gemm-latency":
+        if args.compare_rooflines:
+            if args.output_csv or args.output_params:
+                parser.error(
+                    "--output-csv and --output-params are not supported with "
+                    "--compare-rooflines"
+                )
+            comparison = run_gemm_roofline_comparison(
+                data_dir=args.data_dir,
+                hardware_dir=args.hardware_dir,
+                calibrate_fixed_overhead=not args.no_calibrate_fixed_overhead,
+                training_per_class=args.training_per_class,
+                limit=args.limit,
+            )
+            print(format_gemm_roofline_comparison(comparison))
+            return 0
         report = run_gemm_latency_validation(
             data_dir=args.data_dir,
             hardware_dir=args.hardware_dir,

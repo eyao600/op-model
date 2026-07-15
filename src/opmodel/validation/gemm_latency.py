@@ -25,6 +25,11 @@ from opmodel.validation.artifact_accuracy import (
 
 DEFAULT_GEMM_LATENCY_DATA_DIR = Path("data")
 DEFAULT_TRAINING_PER_CLASS = 8
+DEFAULT_ROOFLINE_COMPARISON_MODELS = (
+    "roofline",
+    "extended_roofline",
+    "effective_roofline",
+)
 _TRAINING_CLASSES = ("vector_like", "small")
 _VALIDATION_GROUPS = ("all", "hardware", "kernel_class")
 
@@ -93,6 +98,108 @@ class GemmLatencyValidationReport:
     metrics: tuple[GemmLatencyMetrics, ...]
     fixed_overheads: Mapping[str, FixedOverheadCalibration]
     skip_counts: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class GemmLatencyModelComparison:
+    model_name: str
+    baseline_model_name: str
+    group: str
+    name: str
+    count: int
+    energy_count: int
+    latency_mape_pct: float
+    latency_mape_delta_pct: float
+    latency_median_ape_pct: float
+    latency_p90_ape_pct: float
+    latency_geomean_ratio: float
+    energy_mape_pct: float
+    energy_mape_delta_pct: float
+    energy_median_ape_pct: float
+    energy_p90_ape_pct: float
+    energy_geomean_ratio: float
+
+
+@dataclass(frozen=True)
+class GemmRooflineComparisonReport:
+    baseline_model_name: str
+    model_names: tuple[str, ...]
+    reports: Mapping[str, GemmLatencyValidationReport]
+    metrics: tuple[GemmLatencyModelComparison, ...]
+
+
+def run_gemm_roofline_comparison(
+    *,
+    data_dir: str | Path = DEFAULT_GEMM_LATENCY_DATA_DIR,
+    hardware_dir: str | Path = DEFAULT_HARDWARE_DIR,
+    model_names: Iterable[str] = DEFAULT_ROOFLINE_COMPARISON_MODELS,
+    baseline_model_name: str = "roofline",
+    calibrate_fixed_overhead: bool = True,
+    training_per_class: int = DEFAULT_TRAINING_PER_CLASS,
+    limit: int | None = None,
+) -> GemmRooflineComparisonReport:
+    names = tuple(str(name) for name in model_names)
+    if not names:
+        raise ValueError("model_names must contain at least one model")
+    if len(set(names)) != len(names):
+        raise ValueError("model_names must be unique")
+    if baseline_model_name not in names:
+        raise ValueError("baseline_model_name must be included in model_names")
+
+    reports = {
+        name: run_gemm_latency_validation(
+            data_dir=data_dir,
+            hardware_dir=hardware_dir,
+            model_name=name,
+            calibrate_fixed_overhead=calibrate_fixed_overhead,
+            training_per_class=training_per_class,
+            limit=limit,
+        )
+        for name in names
+    }
+    baseline_metrics = {
+        (metric.group, metric.name): metric
+        for metric in reports[baseline_model_name].metrics
+    }
+    comparisons: list[GemmLatencyModelComparison] = []
+    for name in names:
+        for metric in reports[name].metrics:
+            baseline = baseline_metrics.get((metric.group, metric.name))
+            if baseline is None:
+                raise ValueError(
+                    "model reports have incompatible validation groups: "
+                    f"{name} has {metric.group}/{metric.name} but the baseline does not"
+                )
+            comparisons.append(
+                GemmLatencyModelComparison(
+                    model_name=name,
+                    baseline_model_name=baseline_model_name,
+                    group=metric.group,
+                    name=metric.name,
+                    count=metric.count,
+                    energy_count=metric.energy_count,
+                    latency_mape_pct=metric.latency_mape_pct,
+                    latency_mape_delta_pct=(
+                        metric.latency_mape_pct - baseline.latency_mape_pct
+                    ),
+                    latency_median_ape_pct=metric.latency_median_ape_pct,
+                    latency_p90_ape_pct=metric.latency_p90_ape_pct,
+                    latency_geomean_ratio=metric.latency_geomean_ratio,
+                    energy_mape_pct=metric.energy_mape_pct,
+                    energy_mape_delta_pct=(
+                        metric.energy_mape_pct - baseline.energy_mape_pct
+                    ),
+                    energy_median_ape_pct=metric.energy_median_ape_pct,
+                    energy_p90_ape_pct=metric.energy_p90_ape_pct,
+                    energy_geomean_ratio=metric.energy_geomean_ratio,
+                )
+            )
+    return GemmRooflineComparisonReport(
+        baseline_model_name=baseline_model_name,
+        model_names=names,
+        reports=reports,
+        metrics=tuple(comparisons),
+    )
 
 
 def run_gemm_latency_validation(
@@ -261,6 +368,78 @@ def format_gemm_latency_report(report: GemmLatencyValidationReport) -> str:
     return "\n".join(lines)
 
 
+def format_gemm_roofline_comparison(
+    report: GemmRooflineComparisonReport,
+) -> str:
+    baseline = report.baseline_model_name
+    baseline_report = report.reports[baseline]
+    validation_count = sum(
+        1 for row in baseline_report.rows if row.split == "validation"
+    )
+    lines = [
+        "GEMM roofline model comparison:",
+        f"  models={', '.join(report.model_names)}",
+        f"  baseline={baseline}",
+        f"  held-out rows={validation_count}",
+        "Held-out latency accuracy (MAPE delta versus baseline):",
+    ]
+    for group in _VALIDATION_GROUPS:
+        group_metrics = tuple(metric for metric in report.metrics if metric.group == group)
+        group_names = tuple(dict.fromkeys(metric.name for metric in group_metrics))
+        for group_name in group_names:
+            lines.append(f"  {group}/{group_name}:")
+            by_model = {
+                metric.model_name: metric
+                for metric in group_metrics
+                if metric.name == group_name
+            }
+            for model_name in report.model_names:
+                metric = by_model[model_name]
+                lines.append(
+                    "    "
+                    f"{model_name}: n={metric.count}, "
+                    f"MAPE={metric.latency_mape_pct:.2f}%, "
+                    f"delta={metric.latency_mape_delta_pct:+.2f}pp, "
+                    f"median={metric.latency_median_ape_pct:.2f}%, "
+                    f"p90={metric.latency_p90_ape_pct:.2f}%, "
+                    f"ratio={metric.latency_geomean_ratio:.3g}"
+                )
+    lines.append("Held-out energy accuracy (MAPE delta versus baseline):")
+    for group in _VALIDATION_GROUPS:
+        group_metrics = tuple(metric for metric in report.metrics if metric.group == group)
+        group_names = tuple(dict.fromkeys(metric.name for metric in group_metrics))
+        for group_name in group_names:
+            lines.append(f"  {group}/{group_name}:")
+            by_model = {
+                metric.model_name: metric
+                for metric in group_metrics
+                if metric.name == group_name
+            }
+            for model_name in report.model_names:
+                metric = by_model[model_name]
+                if metric.energy_count == 0:
+                    lines.append(f"    {model_name}: disabled")
+                    continue
+                lines.append(
+                    "    "
+                    f"{model_name}: n={metric.energy_count}, "
+                    f"MAPE={metric.energy_mape_pct:.2f}%, "
+                    f"delta={metric.energy_mape_delta_pct:+.2f}pp, "
+                    f"median={metric.energy_median_ape_pct:.2f}%, "
+                    f"p90={metric.energy_p90_ape_pct:.2f}%, "
+                    f"ratio={metric.energy_geomean_ratio:.3g}"
+                )
+    lines.append("Calibrated fixed overhead cycles by model/hardware:")
+    for model_name in report.model_names:
+        overheads = report.reports[model_name].fixed_overheads
+        values = ", ".join(
+            f"{hardware}={item.calibrated_fixed_overhead_cycles}"
+            for hardware, item in sorted(overheads.items())
+        )
+        lines.append(f"  {model_name}: {values or 'none'}")
+    return "\n".join(lines)
+
+
 def classify_gemm_size(*, batch: int, dim_m: int, dim_n: int, dim_k: int) -> str:
     min_mn = min(dim_m, dim_n)
     max_mn = max(dim_m, dim_n)
@@ -410,8 +589,8 @@ def _estimate_fixed_overhead_cycles(
     residuals: list[float] = []
     for sample in samples:
         profile = model.predict(sample.op, zero_overhead_hardware)
-        clock_hz = float(profile.diagnostics.get("clock_hz") or hardware.compute.clock_hz or 1.0e9)
-        modeled_cycles = float(profile.diagnostics.get("modeled_device_cycles", 0.0))
+        clock_hz = _profile_clock_hz(profile, hardware)
+        modeled_cycles = _profile_modeled_cycles(profile, clock_hz)
         measured_cycles = sample.measured_latency_ms * clock_hz / 1000.0
         residuals.append(measured_cycles - modeled_cycles)
     return int(round(max(0.0, _median(residuals))))
@@ -425,12 +604,26 @@ def _predict_row(
     split: str,
 ) -> GemmLatencyRow:
     profile = model.predict(sample.op, hardware)
-    predicted_latency_ms = profile.latency_s * 1000.0
-    predicted_energy_j = profile.energy_j
+    diagnostics = profile.diagnostics
+    clock_hz = _profile_clock_hz(profile, hardware)
+    modeled_cycles = _profile_modeled_cycles(profile, clock_hz)
+    native_total_cycles = _optional_float(diagnostics.get("total_device_cycles"))
+    fixed_overhead_cycles = int(hardware.compute.device_fixed_overhead_cycles or 0)
+    if native_total_cycles is None:
+        total_device_cycles = modeled_cycles + fixed_overhead_cycles
+        predicted_latency_s = total_device_cycles / clock_hz
+        predicted_energy_j = (
+            profile.energy_j
+            + hardware.static_power_w * fixed_overhead_cycles / clock_hz
+        )
+    else:
+        total_device_cycles = native_total_cycles
+        predicted_latency_s = profile.latency_s
+        predicted_energy_j = profile.energy_j
+    predicted_latency_ms = predicted_latency_s * 1000.0
     latency_ratio = predicted_latency_ms / sample.measured_latency_ms
     energy_ratio = predicted_energy_j / sample.measured_energy_j
     dims = _sample_dims(sample)
-    diagnostics = profile.diagnostics
     return GemmLatencyRow(
         source_file=sample.source_file,
         row_index=sample.row_index,
@@ -457,13 +650,40 @@ def _predict_row(
         energy_ratio=energy_ratio,
         energy_abs_pct_error=abs(energy_ratio - 1.0) * 100.0,
         energy_signed_pct_error=(energy_ratio - 1.0) * 100.0,
-        fixed_overhead_cycles=int(hardware.compute.device_fixed_overhead_cycles or 0),
-        modeled_device_cycles=_optional_float(diagnostics.get("modeled_device_cycles")),
-        total_device_cycles=_optional_float(diagnostics.get("total_device_cycles")),
-        predicted_tflops_per_s=_optional_float(diagnostics.get("predicted_tflops_per_s")),
-        primary_bottleneck=_optional_str(diagnostics.get("primary_bottleneck")),
+        fixed_overhead_cycles=fixed_overhead_cycles,
+        modeled_device_cycles=modeled_cycles,
+        total_device_cycles=total_device_cycles,
+        predicted_tflops_per_s=(
+            _optional_float(diagnostics.get("predicted_tflops_per_s"))
+            or (profile.flops / predicted_latency_s / 1.0e12 if predicted_latency_s else 0.0)
+        ),
+        primary_bottleneck=(
+            _optional_str(diagnostics.get("primary_bottleneck"))
+            or _base_roofline_bottleneck(diagnostics)
+        ),
         secondary_bottlenecks=diagnostics.get("secondary_bottlenecks"),
     )
+
+
+def _profile_clock_hz(profile: Any, hardware: HardwareSpec) -> float:
+    return float(
+        profile.diagnostics.get("clock_hz")
+        or hardware.compute.clock_hz
+        or 1.0e9
+    )
+
+
+def _profile_modeled_cycles(profile: Any, clock_hz: float) -> float:
+    modeled = profile.diagnostics.get("modeled_device_cycles")
+    return float(modeled) if modeled is not None else float(profile.latency_s * clock_hz)
+
+
+def _base_roofline_bottleneck(diagnostics: Mapping[str, Any]) -> str | None:
+    compute = diagnostics.get("compute_latency_s")
+    memory = diagnostics.get("memory_latency_s")
+    if compute is None or memory is None:
+        return None
+    return "compute" if float(compute) >= float(memory) else "hbm"
 
 
 def _aggregate_metrics(rows: tuple[GemmLatencyRow, ...]) -> tuple[GemmLatencyMetrics, ...]:
@@ -507,7 +727,7 @@ def _metrics(
         energy_mape_pct=_mean(energy_ape),
         energy_median_ape_pct=_percentile(energy_ape, 0.5),
         energy_p90_ape_pct=_percentile(energy_ape, 0.9),
-        energy_geomean_ratio=_geomean(row.energy_ratio for row in rows),
+        energy_geomean_ratio=_geomean(row.energy_ratio for row in energy_rows),
         energy_mean_signed_pct_error=_mean(energy_signed),
     )
 

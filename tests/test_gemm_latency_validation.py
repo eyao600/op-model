@@ -12,7 +12,9 @@ from pathlib import Path
 from opmodel.hardware import load_hardware
 from opmodel.validation.gemm_latency import (
     classify_gemm_size,
+    format_gemm_roofline_comparison,
     run_gemm_latency_validation,
+    run_gemm_roofline_comparison,
     _with_fixed_overhead,
 )
 
@@ -164,6 +166,111 @@ def test_cli_validate_gemm_latency_writes_outputs(tmp_path: Path) -> None:
     params = json.loads(output_params.read_text(encoding="utf-8"))
     assert "a10" in params
     assert params["a10"]["training_rows"]
+
+
+def test_base_roofline_validation_applies_calibrated_fixed_overhead(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_gemm_csv(
+        data_dir / "a10_gemm_bf16bf16_freq900_lut.csv",
+        [
+            _row(batch=1, m=1, n=64, k=32, time="0.20"),
+            _row(batch=1, m=16, n=16, k=64, time="0.25"),
+            _row(batch=1, m=128, n=128, k=128, time="0.80"),
+        ],
+    )
+    report = run_gemm_latency_validation(
+        data_dir=data_dir,
+        hardware_dir=HARDWARE_DIR,
+        model_name="roofline",
+        training_per_class=1,
+    )
+
+    overhead = report.fixed_overheads["a10"].calibrated_fixed_overhead_cycles
+    assert overhead > 0
+    assert all(row.modeled_device_cycles is not None for row in report.rows)
+    assert all(row.total_device_cycles is not None for row in report.rows)
+    assert all(
+        math.isclose(
+            row.total_device_cycles - row.modeled_device_cycles,
+            overhead,
+            abs_tol=1.0e-6,
+        )
+        for row in report.rows
+    )
+
+
+def test_roofline_comparison_includes_all_models_and_deltas(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_gemm_csv(
+        data_dir / "a10_gemm_bf16bf16_freq900_lut.csv",
+        [
+            _row(batch=1, m=1, n=64, k=32, time="0.20"),
+            _row(batch=1, m=16, n=16, k=64, time="0.25"),
+            _row(batch=1, m=128, n=128, k=128, time="0.80"),
+        ],
+    )
+    comparison = run_gemm_roofline_comparison(
+        data_dir=data_dir,
+        hardware_dir=HARDWARE_DIR,
+        training_per_class=1,
+    )
+
+    assert comparison.model_names == (
+        "roofline",
+        "extended_roofline",
+        "effective_roofline",
+    )
+    assert set(comparison.reports) == set(comparison.model_names)
+    overall = [metric for metric in comparison.metrics if metric.group == "all"]
+    assert [metric.model_name for metric in overall] == list(comparison.model_names)
+    assert overall[0].latency_mape_delta_pct == 0.0
+    text = format_gemm_roofline_comparison(comparison)
+    assert "baseline=roofline" in text
+    assert "extended_roofline" in text
+    assert "effective_roofline" in text
+    assert "MAPE delta versus baseline" in text
+
+
+def test_cli_compares_all_roofline_models(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_gemm_csv(
+        data_dir / "a10_gemm_bf16bf16_freq900_lut.csv",
+        [
+            _row(batch=1, m=1, n=64, k=32, time="0.20"),
+            _row(batch=1, m=16, n=16, k=64, time="0.25"),
+            _row(batch=1, m=128, n=128, k=128, time="0.80"),
+        ],
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "opmodel.cli",
+            "validate-gemm-latency",
+            "--data-dir",
+            str(data_dir),
+            "--hardware-dir",
+            str(HARDWARE_DIR),
+            "--training-per-class",
+            "1",
+            "--compare-rooflines",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert "GEMM roofline model comparison:" in result.stdout
+    assert "roofline:" in result.stdout
+    assert "extended_roofline:" in result.stdout
+    assert "effective_roofline:" in result.stdout
 
 
 def _write_gemm_csv(path: Path, rows: list[dict[str, str]]) -> None:
