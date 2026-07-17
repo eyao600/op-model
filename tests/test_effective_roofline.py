@@ -13,8 +13,14 @@ from opmodel.cli import profile_to_dict
 from opmodel.hardware import load_hardware
 from opmodel.models.effective_roofline import (
     EffectiveRooflineModel,
+    LocalMatmulGeometry,
+    SMOccupancyClass,
+    _ampere_flash_attention_kernel,
+    _flash_attention_ctas,
+    _local_mini_gemm_service,
     _memory_window_summary,
     _nonzero_effective_rate,
+    _parse_flash_attention_problem,
     _service_from_effective_rate,
     _sm_occupancy_classes,
     _warps_by_smsp,
@@ -24,6 +30,7 @@ from opmodel.registry import create_model
 
 ROOT = Path(__file__).resolve().parents[1]
 HARDWARE = ROOT / "src/opmodel/configs/hardware/a10.yaml"
+A100_HARDWARE = ROOT / "src/opmodel/configs/hardware/a100_40gb_pcie.yaml"
 
 
 def _attrs(**updates: object) -> dict[str, object]:
@@ -81,6 +88,49 @@ def _batched_gemm() -> LocalOp:
     )
 
 
+def _effective_softmax(*, selector: bool = True, reduction: int = 512) -> LocalOp:
+    attrs: dict[str, object] = {"row_size": reduction}
+    if selector:
+        attrs["softmax_kernel"] = "effective_cuda_ampere"
+    shape = (128, reduction)
+    return LocalOp(
+        "softmax",
+        OpKind.SOFTMAX,
+        Phase.INFERENCE,
+        (
+            TensorSpec(TensorRole.INPUT, shape, DType.BF16),
+            TensorSpec(TensorRole.OUTPUT, shape, DType.BF16),
+        ),
+        attrs,
+    )
+
+
+def _flash_attention(*, reuse: str = "ideal_within_wave") -> LocalOp:
+    q_shape = (1, 4, 192, 64)
+    kv_shape = (1, 2, 192, 64)
+    return LocalOp(
+        "flash",
+        OpKind.ATTENTION_PREFILL,
+        Phase.PREFILL,
+        (
+            TensorSpec(TensorRole.INPUT, q_shape, DType.BF16, "q"),
+            TensorSpec(TensorRole.INPUT, kv_shape, DType.BF16, "k"),
+            TensorSpec(TensorRole.INPUT, kv_shape, DType.BF16, "v"),
+            TensorSpec(TensorRole.OUTPUT, q_shape, DType.BF16),
+        ),
+        {
+            "attention_kernel": "flash_attention_ampere",
+            "causal": True,
+            "kv_heads": 2,
+            "block_q": 128,
+            "block_k": 128,
+            "warps_per_cta": 4,
+            "max_concurrent_ctas_per_sm": 2,
+            "kv_reuse_policy": reuse,
+        },
+    )
+
+
 def test_effective_rate_selects_latency_and_peak_ceilings() -> None:
     assert _nonzero_effective_rate(100.0, 20.0, 4.0) == 5.0
     assert _nonzero_effective_rate(100.0, 1000.0, 4.0) == 100.0
@@ -124,7 +174,7 @@ def test_occupancy_classes_conserve_ctas_and_reject_mismatch() -> None:
         )
 
 
-def test_memory_windows_conserve_partial_tail_and_subtract_prologue() -> None:
+def test_memory_windows_use_persistent_concurrency_limited_rate() -> None:
     summary = _memory_window_summary(
         total_stage_equivalents=5.5,
         pipeline_stages=2,
@@ -136,6 +186,18 @@ def test_memory_windows_conserve_partial_tail_and_subtract_prologue() -> None:
     assert summary.window_count == 3
     assert summary.full_window_count == 2
     assert summary.final_window_stage_equivalents == 1.5
+    expected_first_bytes = 3 * 2 * 64.0
+    expected_first_rate = expected_first_bytes / 20.0
+    assert summary.first_window_bytes == expected_first_bytes
+    assert math.isclose(summary.first_window_cycles, 20.0)
+    assert math.isclose(summary.remaining_cycles, summary.remaining_bytes / expected_first_rate)
+    assert math.isclose(
+        summary.total_cycles,
+        summary.first_window_cycles + summary.remaining_cycles,
+    )
+    assert summary.full_window_effective_bytes_per_cycle == expected_first_rate
+    assert summary.latency_bearing_window_count == summary.window_count
+    assert summary.steady_state_bytes_per_cycle == expected_first_rate
     assert math.isclose(
         summary.full_window_count * summary.full_window_bytes
         + summary.final_window_bytes,
@@ -146,6 +208,27 @@ def test_memory_windows_conserve_partial_tail_and_subtract_prologue() -> None:
         summary.total_cycles,
     )
     assert summary.effective_bytes_per_cycle <= summary.raw_bytes_per_cycle
+
+
+def test_memory_windows_use_peak_bandwidth_when_first_window_saturates() -> None:
+    summary = _memory_window_summary(
+        total_stage_equivalents=6.5,
+        pipeline_stages=4,
+        active_ctas=8,
+        bytes_per_cta_stage=64.0,
+        peak_bytes_per_cycle=32.0,
+        latency_cycles=10.0,
+    )
+    assert summary.effective_bytes_per_cycle == 32.0
+    assert math.isclose(summary.total_cycles, summary.total_bytes / 32.0)
+    assert math.isclose(
+        summary.remaining_cycles,
+        summary.remaining_bytes / 32.0,
+    )
+    assert summary.full_window_effective_bytes_per_cycle == 32.0
+    assert summary.final_window_effective_bytes_per_cycle == 32.0
+    assert summary.latency_bearing_window_count == summary.window_count
+    assert summary.steady_state_bytes_per_cycle == 32.0
 
 
 def test_zero_byte_memory_window_has_no_latency_charge() -> None:
@@ -159,6 +242,8 @@ def test_zero_byte_memory_window_has_no_latency_charge() -> None:
     )
     assert summary.total_cycles == 0.0
     assert summary.first_window_cycles == 0.0
+    assert summary.latency_bearing_window_count == 0
+    assert summary.steady_state_bytes_per_cycle == 32.0
 
 
 def test_registry_gemm_batched_and_json_safe_diagnostics() -> None:
@@ -214,6 +299,213 @@ def test_wave_diagnostics_conserve_occupancy_and_bound_rates() -> None:
             ("hbm", "dram_raw_bytes_per_cycle", "dram_effective_bytes_per_cycle"),
         ):
             assert wave[effective_name] <= wave[raw_name] + 1.0e-9, resource
+        for item in wave["occupancy_classes"]:
+            remaining_bytes = max(0, wave["k_groups"] - 1) * item[
+                "smem_group_bytes_per_sm"
+            ]
+            assert math.isclose(
+                item["smem_steady_remaining_cycles"],
+                remaining_bytes / item["smem_effective_bytes_per_cycle_per_sm"],
+            )
+            assert math.isclose(
+                item["smem_cycles"],
+                item["smem_first_group_cycles"]
+                + item["smem_steady_remaining_cycles"],
+            )
+
+
+@pytest.mark.parametrize(
+    ("shared_latency_s", "latency_bound"),
+    ((1.0e-3, True), (1.0e-12, False)),
+)
+def test_smem_uses_persistent_concurrency_limited_rate(
+    shared_latency_s: float,
+    latency_bound: bool,
+) -> None:
+    hardware = load_hardware(HARDWARE)
+    memory_levels = dict(hardware.memory_levels)
+    memory_levels["sram"] = replace(
+        memory_levels["sram"], latency_s=shared_latency_s
+    )
+    hardware = replace(hardware, memory_levels=memory_levels)
+    profile = EffectiveRooflineModel().predict(_gemm(384, 256, 70), hardware)
+    shared_latency_cycles = shared_latency_s * profile.diagnostics["clock_hz"]
+
+    for wave in profile.diagnostics["wave_roofline"].values():
+        if wave["active_ctas"] == 0:
+            continue
+        for item in wave["occupancy_classes"]:
+            group_bytes = item["smem_group_bytes_per_sm"]
+            expected_rate = min(
+                item["smem_raw_bytes_per_cycle_per_sm"],
+                group_bytes / shared_latency_cycles,
+            )
+            assert (expected_rate < item["smem_raw_bytes_per_cycle_per_sm"]) == (
+                latency_bound
+            )
+            assert math.isclose(
+                item["smem_first_group_cycles"],
+                group_bytes / expected_rate,
+            )
+            expected_remaining = (
+                max(0, wave["k_groups"] - 1) * group_bytes / expected_rate
+            )
+            assert math.isclose(
+                item["smem_steady_remaining_cycles"], expected_remaining
+            )
+            assert math.isclose(
+                item["smem_cycles"],
+                item["smem_first_group_cycles"] + expected_remaining,
+            )
+
+
+def test_softmax_effective_selector_is_opt_in_and_conserves_traffic() -> None:
+    hardware = load_hardware(A100_HARDWARE)
+    model = EffectiveRooflineModel()
+    legacy = model.predict(_effective_softmax(selector=False), hardware)
+    effective = model.predict(_effective_softmax(), hardware)
+    assert legacy.implementation == "roofline.softmax"
+    assert effective.implementation == "effective_roofline.softmax_cuda_ampere"
+    assert effective.memory_access.hbm_read_bytes == 128 * 512 * 2
+    assert effective.memory_access.hbm_write_bytes == 128 * 512 * 2
+    assert effective.diagnostics["residency_strategy"] == "register_resident"
+    assert effective.diagnostics["transaction_bytes"]["smem_value_staging"] == 0
+    assert effective.diagnostics["cuda_softmax_compute"]["exp_ops"] > 0
+
+
+def test_softmax_rejects_rows_outside_one_cta_template() -> None:
+    with pytest.raises(ValueError, match="up to 4096"):
+        EffectiveRooflineModel().predict(
+            _effective_softmax(reduction=8192), load_hardware(A100_HARDWARE)
+        )
+
+
+def test_causal_flashattention_conserves_grid_gqa_and_pairs() -> None:
+    op = _flash_attention()
+    problem = _parse_flash_attention_problem(op)
+    kernel = _ampere_flash_attention_kernel(problem, op.attrs)
+    ctas = _flash_attention_ctas(problem, kernel)
+    assert len(ctas) == 8
+    assert {cta.kv_head for cta in ctas if cta.query_head < 2} == {0}
+    assert {cta.kv_head for cta in ctas if cta.query_head >= 2} == {1}
+    useful_pairs = sum(
+        tile.useful_score_elements for cta in ctas for tile in cta.kv_tiles
+    )
+    assert useful_pairs == 4 * 192 * 193 // 2
+    assert all(
+        tile.useful_score_elements <= tile.issued_score_elements
+        for cta in ctas
+        for tile in cta.kv_tiles
+    )
+
+
+def test_flashattention_pipeline_has_no_score_materialization() -> None:
+    profile = EffectiveRooflineModel().predict(
+        _flash_attention(), load_hardware(A100_HARDWARE)
+    )
+    assert profile.implementation == "effective_roofline.flash_attention_ampere_causal"
+    traffic = profile.diagnostics["transaction_bytes"]
+    assert traffic["score_l2"] == traffic["score_hbm"] == 0
+    assert traffic["probability_l2"] == traffic["probability_hbm"] == 0
+    for wave in profile.diagnostics["waves"]:
+        active = wave["active_ctas_by_iteration"]
+        assert all(later <= earlier for earlier, later in zip(active, active[1:]))
+        assert wave["total_cycles"] == pytest.approx(
+            wave["prologue_cycles"] + wave["body_cycles"] + wave["epilogue_cycles"]
+        )
+        for iteration in wave["iterations"]:
+            assert iteration["total_cycles"] == pytest.approx(
+                iteration["qk_softmax_or_v_cycles"]
+                + iteration["pv_or_next_k_cycles"]
+            )
+
+
+def test_flashattention_reuse_reduces_hbm_not_l2_requests() -> None:
+    hardware = load_hardware(A100_HARDWARE)
+    model = EffectiveRooflineModel()
+    none = model.predict(_flash_attention(reuse="none"), hardware)
+    reused = model.predict(_flash_attention(reuse="ideal_within_wave"), hardware)
+    none_bytes = none.diagnostics["transaction_bytes"]
+    reused_bytes = reused.diagnostics["transaction_bytes"]
+    assert none_bytes["k_l2_requested"] == reused_bytes["k_l2_requested"]
+    assert none_bytes["v_l2_requested"] == reused_bytes["v_l2_requested"]
+    assert reused_bytes["k_hbm"] < none_bytes["k_hbm"]
+    assert reused_bytes["v_hbm"] < none_bytes["v_hbm"]
+    assert (
+        reused_bytes["k_hbm_unique_lower_bound"]
+        <= reused_bytes["k_hbm"]
+        <= reused_bytes["k_hbm_requested_upper_bound"]
+    )
+    assert (
+        reused_bytes["v_hbm_unique_lower_bound"]
+        <= reused_bytes["v_hbm"]
+        <= reused_bytes["v_hbm_requested_upper_bound"]
+    )
+
+
+def test_local_mini_gemm_residency_controls_smem_operand_traffic() -> None:
+    common = dict(
+        cta_m=64,
+        cta_n=64,
+        reduction_k=64,
+        live_m=64,
+        live_n=64,
+        live_k=64,
+        warp_m=32,
+        warp_n=32,
+        warp_k=16,
+        mma_m=16,
+        mma_n=8,
+        mma_k=16,
+        warps_per_cta=4,
+        rhs_smem_resident=True,
+        input_bytes=2.0,
+    )
+    kwargs = dict(
+        occupancy_classes=(SMOccupancyClass("busy", 1, 1),),
+        represented_sms=1,
+        peak_tensor_flops_per_cycle=1024.0,
+        peak_smem_bytes_per_cycle=128.0,
+        tensor_latency_cycles=26.0,
+        shared_latency_cycles=29.0,
+    )
+    both = _local_mini_gemm_service(
+        geometry=LocalMatmulGeometry(lhs_smem_resident=True, **common), **kwargs
+    )
+    rhs_only = _local_mini_gemm_service(
+        geometry=LocalMatmulGeometry(lhs_smem_resident=False, **common), **kwargs
+    )
+    assert rhs_only.issued_flops == both.issued_flops
+    assert rhs_only.smem_read_bytes < both.smem_read_bytes
+
+
+def test_standalone_softmax_smem_schedule_conserves_value_staging() -> None:
+    profile = EffectiveRooflineModel().predict(
+        _effective_softmax(reduction=2048), load_hardware(A100_HARDWARE)
+    )
+    input_bytes = 128 * 2048 * 2
+    assert profile.diagnostics["residency_strategy"] == "smem_staged"
+    assert profile.diagnostics["transaction_bytes"]["smem_value_staging"] == 3 * input_bytes
+    reduction = profile.diagnostics["transaction_bytes"]["smem_reduction"]
+    assert (
+        profile.memory_access.sram_read_bytes
+        + profile.memory_access.sram_write_bytes
+        - reduction
+        == 3 * input_bytes
+    )
+
+
+def test_flashattention_rejects_noncausal_and_missing_occupancy() -> None:
+    hardware = load_hardware(A100_HARDWARE)
+    op = _flash_attention()
+    with pytest.raises(ValueError, match="requires causal=True"):
+        EffectiveRooflineModel().predict(
+            replace(op, attrs={**op.attrs, "causal": False}), hardware
+        )
+    attrs = dict(op.attrs)
+    attrs.pop("max_concurrent_ctas_per_sm")
+    with pytest.raises(ValueError, match="requires max_concurrent"):
+        EffectiveRooflineModel().predict(replace(op, attrs=attrs), hardware)
 
 
 def test_underfilled_tail_is_evaluated_with_lower_concurrency() -> None:

@@ -159,7 +159,7 @@ def test_artifact_report_writes_csv_and_svg(tmp_path: Path) -> None:
     assert "1.0 perfect" in svg
     assert "latency predicted / measured" in svg
     assert "energy predicted / measured" in svg
-    assert len(plot_paths) == 3
+    assert len(plot_paths) == 4
     gemm_svg = (tmp_path / "reports" / "accuracy_gemm_workloads.svg").read_text(
         encoding="utf-8"
     )
@@ -170,6 +170,59 @@ def test_artifact_report_writes_csv_and_svg(tmp_path: Path) -> None:
     assert "B16/MNK256" in gemm_svg
     assert "Softmax workload ratios" in softmax_svg
     assert "B2^13/D512" in softmax_svg
+
+
+def test_validation_ingests_effective_softmax_and_flashattention(
+    tmp_path: Path,
+) -> None:
+    _write_csv(
+        tmp_path / "yz8_softmax_bf16_freq900_lut.csv",
+        ["batch", "dim", "time", "energy", "prec"],
+        [{"batch": "128", "dim": "512", "time": "0.1", "energy": "0.01", "prec": "bf16"}],
+    )
+    _write_csv(
+        tmp_path / "yz8_flashattention_freq900_lut.csv",
+        [
+            "batch",
+            "n_head",
+            "seq_len",
+            "head_dim",
+            "time",
+            "energy",
+            "precM",
+            "precA",
+            "kernel_name",
+            "max_concurrent_block",
+        ],
+        [
+            {
+                "batch": "1",
+                "n_head": "4",
+                "seq_len": "128",
+                "head_dim": "64",
+                "time": "0.1",
+                "energy": "0.01",
+                "precM": "bf16",
+                "precA": "bf16",
+                "kernel_name": (
+                    "Flash_fwd_kernel_traits<(int)64, (int)128, "
+                    "(int)128, (int)4"
+                ),
+                "max_concurrent_block": "2",
+            }
+        ],
+    )
+    report = run_artifact_validation(
+        data_dir=tmp_path,
+        hardware_dir=HARDWARE_DIR,
+        model_name="effective_roofline",
+    )
+    assert {row.op_kind for row in report.rows} == {
+        "softmax",
+        "attention_prefill",
+    }
+    assert all(row.predicted_latency_ms > 0.0 for row in report.rows)
+    assert all(row.predicted_energy_j > 0.0 for row in report.rows)
 
 
 def test_real_artifact_data_smoke() -> None:

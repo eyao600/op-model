@@ -376,6 +376,8 @@ def _sample_from_row(
         dimensions, op = _layernorm_sample(csv_path, row_index, row)
     elif op_kind == OpKind.SOFTMAX.value:
         dimensions, op = _softmax_sample(csv_path, row_index, row)
+    elif op_kind == OpKind.ATTENTION_PREFILL.value:
+        dimensions, op = _flash_attention_sample(csv_path, row_index, row)
     else:
         raise ValueError(f"unsupported op kind {op_kind}")
 
@@ -858,9 +860,70 @@ def _softmax_sample(
         name=_op_name(csv_path, row_index),
         kind=OpKind.SOFTMAX,
         phase=Phase.INFERENCE,
-        attrs={"row_size": dim},
+        attrs={"row_size": dim, "softmax_kernel": "effective_cuda_ampere"},
         tensors=(
             TensorSpec(TensorRole.INPUT, shape, DType.BF16),
+            TensorSpec(TensorRole.OUTPUT, shape, DType.BF16),
+        ),
+    )
+
+
+def _flash_attention_sample(
+    csv_path: Path, row_index: int, row: Mapping[str, str]
+) -> tuple[Mapping[str, Any], LocalOp]:
+    kernel_name = str(row.get("kernel_name", ""))
+    if "splitkv" in kernel_name.lower():
+        raise ValueError("unsupported FlashAttention split-KV kernel")
+    batch = _int_field(row, "batch")
+    heads = _int_field(row, "n_head")
+    sequence = _int_field(row, "seq_len")
+    head_dim = _int_field(row, "head_dim")
+    traits = re.search(
+        r"Flash_fwd_kernel_traits<\(int\)(\d+), \(int\)(\d+), "
+        r"\(int\)(\d+), \(int\)(\d+)",
+        kernel_name,
+    )
+    if traits is None:
+        raise ValueError("unrecognized FlashAttention kernel traits")
+    trait_head_dim, block_q, block_k, warps = (int(value) for value in traits.groups())
+    if trait_head_dim != head_dim:
+        raise ValueError("FlashAttention kernel head dimension mismatch")
+    max_concurrent = _optional_positive_int_field(row, "max_concurrent_block")
+    if max_concurrent is None:
+        raise ValueError("FlashAttention row lacks max_concurrent_block")
+    shape = (batch, heads, sequence, head_dim)
+    dimensions = {
+        "batch": batch,
+        "heads": heads,
+        "seq_q": sequence,
+        "seq_kv": sequence,
+        "head_dim": head_dim,
+        "block_q": block_q,
+        "block_k": block_k,
+        "warps": warps,
+        "causal_validation_assumption": True,
+    }
+    attrs = {
+        "attention_kernel": "flash_attention_ampere",
+        "causal": True,
+        "causal_alignment": "bottom_right",
+        "block_q": block_q,
+        "block_k": block_k,
+        "warps_per_cta": warps,
+        "threads_per_cta": warps * 32,
+        "max_concurrent_ctas_per_sm": max_concurrent,
+        "pipeline_stages": 2,
+        "kv_reuse_policy": "ideal_within_wave",
+    }
+    return dimensions, LocalOp(
+        name=_op_name(csv_path, row_index),
+        kind=OpKind.ATTENTION_PREFILL,
+        phase=Phase.PREFILL,
+        attrs=attrs,
+        tensors=(
+            TensorSpec(TensorRole.INPUT, shape, DType.BF16, layout="q"),
+            TensorSpec(TensorRole.INPUT, shape, DType.BF16, layout="k"),
+            TensorSpec(TensorRole.INPUT, shape, DType.BF16, layout="v"),
             TensorSpec(TensorRole.OUTPUT, shape, DType.BF16),
         ),
     )
@@ -1533,6 +1596,8 @@ def _hardware_info_for_file(filename: str) -> tuple[str, str] | None:
 
 def _supported_op_kind(filename: str) -> str | None:
     lower_name = filename.lower()
+    if "flashattention" in lower_name or "flash_attention" in lower_name:
+        return OpKind.ATTENTION_PREFILL.value
     if "bf16" not in lower_name:
         return None
     if "gemm" in lower_name:

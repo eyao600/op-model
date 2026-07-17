@@ -10,6 +10,11 @@ dist/
 venv/
 validation_artifacts/*
 experiments/*
+data/
+effective_roofline.md
+effective_roofline_flashattention_plan.md
+precollected_database.tar.gz
+*:Zone.Identifier
 tests/*
 !tests/test_gemm_latency_validation.py
 !tests/test_effective_roofline.py
