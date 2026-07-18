@@ -443,7 +443,7 @@ def format_gemm_roofline_comparison(
 def classify_gemm_size(*, batch: int, dim_m: int, dim_n: int, dim_k: int) -> str:
     min_mn = min(dim_m, dim_n)
     max_mn = max(dim_m, dim_n)
-    if dim_m == 1:
+    if dim_m == 1 and dim_n > 1 and dim_k > 1:
         return "vector_like"
     if dim_m * dim_n <= 4096:
         return "small"
