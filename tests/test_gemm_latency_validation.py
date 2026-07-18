@@ -25,6 +25,8 @@ HARDWARE_DIR = ROOT / "src/opmodel/configs/hardware"
 
 def test_gemm_size_classification_precedence() -> None:
     assert classify_gemm_size(batch=1, dim_m=1, dim_n=4096, dim_k=16) == "vector_like"
+    assert classify_gemm_size(batch=1, dim_m=4096, dim_n=1, dim_k=16) == "small"
+    assert classify_gemm_size(batch=1, dim_m=4096, dim_n=128, dim_k=1) == "small_k"
     assert classify_gemm_size(batch=1, dim_m=64, dim_n=64, dim_k=16) == "small"
     assert classify_gemm_size(batch=1, dim_m=64, dim_n=1024, dim_k=128) == "skinny"
     assert classify_gemm_size(batch=1, dim_m=128, dim_n=128, dim_k=16) == "small_k"
