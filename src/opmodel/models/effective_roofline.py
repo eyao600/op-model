@@ -1059,9 +1059,11 @@ def _evaluate_gemm_template_candidates(
                 template=template,
                 kernel=kernel,
                 profile=profile,
-                selection_energy_j=extended._selection_energy_j(
-                    profile, problem, hardware
-                ),
+                # Effective-roofline GEMM profiles already charge padded MMA
+                # instructions in their compute event energy.  The extended
+                # helper adds that padding to useful-FLOP energy and would
+                # therefore count it twice here.
+                selection_energy_j=profile.energy_j,
                 cheap_rank=rank,
                 cheap_score=extended._cheap_template_score(
                     template, problem, hardware, objective
@@ -1154,8 +1156,14 @@ def _estimate_gemm_with_kernel(
         grid.useful_flops / total_device_cycles if total_device_cycles else 0.0
     )
     tflops_per_s = grid.useful_flops / latency_s / 1.0e12 if latency_s else 0.0
+    compute_event_flops = _gemm_compute_event_flops(
+        kernel=kernel,
+        grid=grid,
+        occupancy=occupancy,
+        timeline=timeline,
+    )
     energy_breakdown = estimate_energy(
-        flops=grid.useful_flops,
+        flops=compute_event_flops,
         memory_access=traffic.memory_access,
         engine=EngineKind.TENSOR,
         dtype=problem.input_dtype,
@@ -1176,6 +1184,7 @@ def _estimate_gemm_with_kernel(
         tflops_per_s=tflops_per_s,
         hardware=hardware,
         fixed_overhead_cycles=fixed_overhead_cycles,
+        compute_event_flops=compute_event_flops,
     )
     profile = OpProfile(
         latency_s=latency_s,
@@ -1189,6 +1198,30 @@ def _estimate_gemm_with_kernel(
         diagnostics=diagnostics,
     )
     return apply_calibrated_energy_model(profile, hardware)
+
+
+def _gemm_compute_event_flops(
+    *,
+    kernel: extended.GemmKernelSpec,
+    grid: extended.GridAccounting,
+    occupancy: extended.OccupancyResult,
+    timeline: EffectiveTimelineResult,
+) -> float:
+    """Return executed arithmetic work to charge as a compute energy event.
+
+    Tensor instructions consume energy for the complete issued MMA shape even
+    when boundary lanes do not contribute useful output elements.  Scalar
+    fallback kernels do not have that tensor-tile padding contract, so retain
+    their useful arithmetic count.
+    """
+    if (kernel.mma_m, kernel.mma_n, kernel.mma_k) == (1, 1, 1):
+        return grid.useful_flops
+    full_wave_count = max(0, occupancy.wave_count - 1)
+    issued_flops = (
+        full_wave_count * timeline.full_wave.issued_flops
+        + timeline.last_wave.issued_flops
+    )
+    return max(grid.useful_flops, issued_flops)
 
 
 def _effective_timeline(
@@ -2044,6 +2077,7 @@ def _diagnostics(
     tflops_per_s: float,
     hardware: HardwareSpec,
     fixed_overhead_cycles: float,
+    compute_event_flops: float,
 ) -> dict[str, Any]:
     full_count = max(0, occupancy.wave_count - 1)
     total_device_cycles = timeline.kernel_cycles + fixed_overhead_cycles
@@ -2172,6 +2206,8 @@ def _diagnostics(
         "useful_flops": useful,
         "issued_flops": issued,
         "grid_issued_flops": grid.issued_flops,
+        "compute_event_flops": compute_event_flops,
+        "padded_mma_event_flops": max(0.0, compute_event_flops - useful),
         "tile_efficiency": useful / issued if issued else 0.0,
         "logical_bytes": {
             "a": traffic.a_logical_bytes,

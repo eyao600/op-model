@@ -559,6 +559,38 @@ def test_fixed_overhead_energy_and_non_tensor_fallback() -> None:
     assert fallback.implementation == "effective_roofline.gemm"
 
 
+def test_tensor_gemm_energy_charges_padded_mma_events() -> None:
+    hardware = load_hardware(HARDWARE)
+    profile = EffectiveRooflineModel().predict(_gemm(1, 128, 128), hardware)
+    diagnostics = profile.diagnostics
+    event_flops = diagnostics["compute_event_flops"]
+
+    assert event_flops == diagnostics["issued_flops"]
+    assert event_flops > diagnostics["useful_flops"]
+    assert diagnostics["padded_mma_event_flops"] == (
+        event_flops - diagnostics["useful_flops"]
+    )
+    assert profile.energy_breakdown.compute_j == pytest.approx(
+        event_flops * hardware.compute.tensor_energy_j_per_flop[DType.BF16]
+    )
+
+
+def test_scalar_gemm_energy_does_not_charge_tensor_tile_padding() -> None:
+    hardware = load_hardware(HARDWARE)
+    profile = EffectiveRooflineModel().predict(
+        _gemm(
+            1,
+            128,
+            128,
+            attrs=_attrs(mma_m=1, mma_n=1, mma_k=1),
+        ),
+        hardware,
+    )
+
+    assert profile.diagnostics["compute_event_flops"] == profile.flops
+    assert profile.diagnostics["padded_mma_event_flops"] == 0.0
+
+
 def test_automatic_selection_uses_effective_backend() -> None:
     profile = EffectiveRooflineModel().predict(
         _gemm(attrs={"gemm_selection_shortlist_size": 2}),
@@ -568,6 +600,7 @@ def test_automatic_selection_uses_effective_backend() -> None:
     assert selection["enabled"]
     assert selection["backend"] == "effective_roofline"
     assert selection["shortlist_size"] == 2
+    assert selection["selection_energy_j"] == selection["selected_energy_j"]
 
     with pytest.raises(ValueError, match="must be effective_roofline"):
         EffectiveRooflineModel().predict(
