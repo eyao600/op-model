@@ -585,6 +585,15 @@ def test_gemm_energy_charges_output_store_at_l2_and_hbm() -> None:
     assert profile.memory_access.hbm_write_bytes == store_bytes
 
 
+def test_gemm_energy_charges_modeled_epilogue_smem_traffic() -> None:
+    hardware = load_hardware(HARDWARE)
+    profile = create_model("effective_roofline").predict(_gemm(65, 33, 64), hardware)
+
+    epilogue_bytes = profile.diagnostics["transaction_bytes"]["epilogue_smem"]
+    assert epilogue_bytes > 0
+    assert profile.memory_access.sram_write_bytes == epilogue_bytes
+
+
 def test_scalar_gemm_energy_does_not_charge_tensor_tile_padding() -> None:
     hardware = load_hardware(HARDWARE)
     profile = EffectiveRooflineModel().predict(

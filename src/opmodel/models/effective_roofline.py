@@ -1173,6 +1173,11 @@ def _estimate_gemm_with_kernel(
             if "l2" in hardware.memory_levels
             else None
         ),
+        sram_write_bytes=(
+            int(timeline.epilogue_smem_bytes)
+            if "sram" in hardware.memory_levels
+            else None
+        ),
     )
     energy_breakdown = estimate_energy(
         flops=compute_event_flops,
