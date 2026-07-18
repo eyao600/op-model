@@ -5,13 +5,24 @@ from types import SimpleNamespace
 
 import pytest
 
+from opmodel.api import (
+    EnergyBreakdown,
+    EngineKind,
+    GlobalFootprint,
+    MemoryAccess,
+    OpProfile,
+)
 from opmodel.calibration import (
     _fit_nonnegative_two_feature_power,
     _sample_key,
     _stratified_by_scale,
     _weighted_feature_scales,
 )
-from opmodel.energy import EnergyFeatureRow, predict_e3_energy
+from opmodel.energy import (
+    EnergyFeatureRow,
+    extract_gemm_e3_features,
+    predict_e3_energy,
+)
 from opmodel.hardware import EnergyModelPowerCoefficients
 
 
@@ -97,3 +108,33 @@ def test_e3_energy_levels_are_additive() -> None:
     assert prediction.e1_j == 21.0
     assert prediction.e2_j == 30.0
     assert prediction.e3_j == 30.0 + 25.0 + 49.0 + 34.0 + 121.0 + 169.0
+
+
+def test_exposed_dram_time_subtracts_overlapped_tensor_service() -> None:
+    profile = OpProfile(
+        latency_s=1.0,
+        energy_j=0.0,
+        flops=0.0,
+        engine=EngineKind.TENSOR,
+        footprint=GlobalFootprint(),
+        memory_access=MemoryAccess(),
+        energy_breakdown=EnergyBreakdown(),
+        implementation="test",
+        diagnostics={
+            "clock_hz": 100.0,
+            "active_cycles": {
+                "compute": 20.0,
+                "dram": 50.0,
+                "l2": 0.0,
+                "smem": 0.0,
+            },
+            "cta_waves": 0,
+        },
+    )
+
+    features = extract_gemm_e3_features(profile)
+
+    assert features.time_tc_active_s == pytest.approx(0.2)
+    assert features.time_dram_active_s == pytest.approx(0.5)
+    assert features.time_dram_exposed_s == pytest.approx(0.3)
+    assert EnergyModelPowerCoefficients().dram_exposed_power_w == 0.0
