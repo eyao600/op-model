@@ -18,6 +18,7 @@ E3_POWER_FEATURE_ORDER = (
     "time_sm_resident_s",
     "time_tc_active_s",
     "time_dram_active_s",
+    "time_dram_exposed_s",
     "time_l2_active_s",
     "time_smem_active_s",
 )
@@ -34,6 +35,7 @@ class EnergyFeatureRow:
     time_sm_resident_s: float
     time_tc_active_s: float
     time_dram_active_s: float
+    time_dram_exposed_s: float
     time_l2_active_s: float
     time_smem_active_s: float
 
@@ -48,6 +50,7 @@ class EnergyPrediction:
     residency_j: float
     tc_active_j: float
     dram_active_j: float
+    dram_exposed_j: float
     l2_active_j: float
     smem_active_j: float
 
@@ -56,6 +59,7 @@ class EnergyPrediction:
         return (
             self.tc_active_j
             + self.dram_active_j
+            + self.dram_exposed_j
             + self.l2_active_j
             + self.smem_active_j
         )
@@ -117,6 +121,7 @@ class EnergyPrediction:
                 "residency": self.residency_j,
                 "tc_active": self.tc_active_j,
                 "dram_active": self.dram_active_j,
+                "dram_exposed": self.dram_exposed_j,
                 "l2_active": self.l2_active_j,
                 "smem_active": self.smem_active_j,
                 "active_state": self.active_state_j,
@@ -144,6 +149,8 @@ def extract_gemm_e3_features(profile: OpProfile) -> EnergyFeatureRow:
 
     memory_access = profile.memory_access
     transaction_bytes = _mapping_value(diagnostics, "transaction_bytes")
+    time_tc_active_s = _active_time_s(diagnostics, "compute", clock_hz)
+    time_dram_active_s = _active_time_s(diagnostics, "dram", clock_hz)
     return EnergyFeatureRow(
         flops_total=float(profile.flops),
         bytes_dram_total=float(
@@ -162,8 +169,9 @@ def extract_gemm_e3_features(profile: OpProfile) -> EnergyFeatureRow:
         + float(transaction_bytes.get("epilogue_smem") or 0.0),
         time_kernel_s=float(profile.latency_s),
         time_sm_resident_s=_sm_resident_time_s(diagnostics, clock_hz),
-        time_tc_active_s=_active_time_s(diagnostics, "compute", clock_hz),
-        time_dram_active_s=_active_time_s(diagnostics, "dram", clock_hz),
+        time_tc_active_s=time_tc_active_s,
+        time_dram_active_s=time_dram_active_s,
+        time_dram_exposed_s=max(0.0, time_dram_active_s - time_tc_active_s),
         time_l2_active_s=_active_time_s(diagnostics, "l2", clock_hz),
         time_smem_active_s=_active_time_s(diagnostics, "smem", clock_hz),
     )
@@ -183,6 +191,8 @@ def predict_e3_energy(
         tc_active_j=features.time_tc_active_s * power_coefficients.tc_active_power_w,
         dram_active_j=features.time_dram_active_s
         * power_coefficients.dram_active_power_w,
+        dram_exposed_j=features.time_dram_exposed_s
+        * power_coefficients.dram_exposed_power_w,
         l2_active_j=features.time_l2_active_s * power_coefficients.l2_active_power_w,
         smem_active_j=features.time_smem_active_s
         * power_coefficients.smem_active_power_w,

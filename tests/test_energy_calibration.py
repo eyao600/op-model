@@ -73,6 +73,7 @@ def test_e3_energy_levels_are_additive() -> None:
         time_sm_resident_s=3.0,
         time_tc_active_s=5.0,
         time_dram_active_s=7.0,
+        time_dram_exposed_s=2.0,
         time_l2_active_s=11.0,
         time_smem_active_s=13.0,
     )
@@ -81,6 +82,7 @@ def test_e3_energy_levels_are_additive() -> None:
         sm_resident_power_w=3.0,
         tc_active_power_w=5.0,
         dram_active_power_w=7.0,
+        dram_exposed_power_w=17.0,
         l2_active_power_w=11.0,
         smem_active_power_w=13.0,
     )
@@ -94,4 +96,4 @@ def test_e3_energy_levels_are_additive() -> None:
     assert prediction.e0_j == 17.0
     assert prediction.e1_j == 21.0
     assert prediction.e2_j == 30.0
-    assert prediction.e3_j == 30.0 + 25.0 + 49.0 + 121.0 + 169.0
+    assert prediction.e3_j == 30.0 + 25.0 + 49.0 + 34.0 + 121.0 + 169.0

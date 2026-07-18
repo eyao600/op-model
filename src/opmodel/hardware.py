@@ -55,6 +55,7 @@ class EnergyModelPowerCoefficients:
     sm_resident_power_w: float = 0.0
     tc_active_power_w: float = 0.0
     dram_active_power_w: float = 0.0
+    dram_exposed_power_w: float = 0.0
     l2_active_power_w: float = 0.0
     smem_active_power_w: float = 0.0
 
@@ -286,6 +287,9 @@ def _parse_energy_model(data: Any) -> EnergyModelSpec | None:
             dram_active_power_w=float(
                 coefficients_data.get("dram_active_power_w", 0.0)
             ),
+            dram_exposed_power_w=float(
+                coefficients_data.get("dram_exposed_power_w", 0.0)
+            ),
             l2_active_power_w=float(coefficients_data.get("l2_active_power_w", 0.0)),
             smem_active_power_w=float(
                 coefficients_data.get("smem_active_power_w", 0.0)
@@ -307,6 +311,7 @@ def _validate_energy_model(energy_model: EnergyModelSpec) -> None:
         "sm_resident_power_w",
         "tc_active_power_w",
         "dram_active_power_w",
+        "dram_exposed_power_w",
         "l2_active_power_w",
         "smem_active_power_w",
     ):

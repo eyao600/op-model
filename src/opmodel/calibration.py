@@ -45,6 +45,7 @@ _POWER_COEFFICIENT_FIELDS = (
     "sm_resident_power_w",
     "tc_active_power_w",
     "dram_active_power_w",
+    "dram_exposed_power_w",
     "l2_active_power_w",
     "smem_active_power_w",
 )
@@ -146,11 +147,11 @@ def calibrate_energy_from_artifact_database(
     energy_model = EnergyModelSpec(
         model_level="E3",
         power_coefficients=coefficients,
-        feature_order=("time_kernel_s", "time_dram_active_s"),
+        feature_order=("time_kernel_s", "time_dram_exposed_s"),
         calibration={
             "source": "artifact_validation_database",
             "calibration_date": date.today().isoformat(),
-            "policy": "normalized_static_plus_dram_active_power_nnls",
+            "policy": "normalized_static_plus_exposed_dram_power_nnls",
             "profile_model": energy_model_name,
             "latency_ape_limit_pct": ENERGY_CALIBRATION_LATENCY_APE_LIMIT_PCT,
             "training_per_class": DEFAULT_ENERGY_TRAINING_PER_CLASS,
@@ -171,7 +172,9 @@ def calibrate_energy_from_artifact_database(
             "notes": (
                 "FLOP and byte event coefficients are fixed from hardware config; "
                 "normalized nonnegative regression calibrates only residual base "
-                "and DRAM-active power terms. Other E3 durations are excluded from "
+                "and exposed-DRAM power terms. Exposed DRAM time is the nonnegative "
+                "difference between peak-equivalent DRAM and tensor-core active "
+                "times. Other E3 durations are excluded from "
                 "this minimal model because the calibration feature audit found "
                 "strong collinearity with kernel time."
             ),
@@ -227,6 +230,7 @@ def energy_model_to_config(energy_model: EnergyModelSpec) -> dict[str, Any]:
             "sm_resident_power_w": coefficients.sm_resident_power_w,
             "tc_active_power_w": coefficients.tc_active_power_w,
             "dram_active_power_w": coefficients.dram_active_power_w,
+            "dram_exposed_power_w": coefficients.dram_exposed_power_w,
             "l2_active_power_w": coefficients.l2_active_power_w,
             "smem_active_power_w": coefficients.smem_active_power_w,
         },
@@ -392,10 +396,10 @@ def _fit_static_dram_power_coefficients(
     model_name: str = "effective_roofline",
 ) -> EnergyModelPowerCoefficients:
     rows = _power_fit_rows(samples, hardware, model_name=model_name)
-    base_power_w, dram_active_power_w = _fit_nonnegative_two_feature_power(rows)
+    base_power_w, dram_exposed_power_w = _fit_nonnegative_two_feature_power(rows)
     return EnergyModelPowerCoefficients(
         base_power_w=base_power_w,
-        dram_active_power_w=dram_active_power_w,
+        dram_exposed_power_w=dram_exposed_power_w,
     )
 
 
@@ -417,7 +421,7 @@ def _power_fit_rows(
         rows.append(
             (
                 features.time_kernel_s,
-                features.time_dram_active_s,
+                features.time_dram_exposed_s,
                 residual_j,
                 sample.measured_energy_j,
             )
