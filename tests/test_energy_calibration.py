@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 
 from opmodel.calibration import (
     _fit_nonnegative_two_feature_power,
+    _sample_key,
+    _stratified_by_scale,
     _weighted_feature_scales,
 )
 from opmodel.energy import EnergyFeatureRow, predict_e3_energy
@@ -37,6 +40,27 @@ def test_nonnegative_power_fit_clamps_unphysical_residual() -> None:
     ]
 
     assert _fit_nonnegative_two_feature_power(rows) == (0.0, 0.0)
+
+
+def test_calibration_selection_is_deterministic_and_disjoint_from_heldout() -> None:
+    rows = [
+        (SimpleNamespace(source_file="samples.csv", row_index=index), float(index))
+        for index in range(1, 13)
+    ]
+
+    first = _stratified_by_scale(rows, count=4, quantile_offset=0.1)
+    second = _stratified_by_scale(rows, count=4, quantile_offset=0.1)
+    fit_keys = {_sample_key(sample) for sample, _scale in first}
+    heldout_keys = {
+        _sample_key(sample)
+        for sample, _scale in rows
+        if _sample_key(sample) not in fit_keys
+    }
+
+    assert first == second
+    assert len(fit_keys) == 4
+    assert len(heldout_keys) == 8
+    assert fit_keys.isdisjoint(heldout_keys)
 
 
 def test_e3_energy_levels_are_additive() -> None:
