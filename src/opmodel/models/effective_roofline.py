@@ -1162,9 +1162,21 @@ def _estimate_gemm_with_kernel(
         occupancy=occupancy,
         timeline=timeline,
     )
+    # Global stores are serviced by L2 on their path to HBM.  The timing
+    # traffic object intentionally keeps mainloop L2 requests separate from
+    # the serial epilogue, but energy must charge the store transaction at
+    # both memory levels.
+    energy_memory_access = replace(
+        traffic.memory_access,
+        l2_write_bytes=(
+            traffic.d_store_transaction_bytes
+            if "l2" in hardware.memory_levels
+            else None
+        ),
+    )
     energy_breakdown = estimate_energy(
         flops=compute_event_flops,
-        memory_access=traffic.memory_access,
+        memory_access=energy_memory_access,
         engine=EngineKind.TENSOR,
         dtype=problem.input_dtype,
         hardware=hardware,
@@ -1192,7 +1204,7 @@ def _estimate_gemm_with_kernel(
         flops=grid.useful_flops,
         engine=EngineKind.TENSOR,
         footprint=footprint,
-        memory_access=traffic.memory_access,
+        memory_access=energy_memory_access,
         energy_breakdown=energy_breakdown,
         implementation=_implementation_name(batched),
         diagnostics=diagnostics,

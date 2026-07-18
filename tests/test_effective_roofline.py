@@ -575,6 +575,16 @@ def test_tensor_gemm_energy_charges_padded_mma_events() -> None:
     )
 
 
+def test_gemm_energy_charges_output_store_at_l2_and_hbm() -> None:
+    hardware = load_hardware(HARDWARE)
+    profile = create_model("effective_roofline").predict(_gemm(65, 33, 64), hardware)
+
+    store_bytes = profile.diagnostics["transaction_bytes"]["d_store"]
+    assert store_bytes > 65 * 33 * 2
+    assert profile.memory_access.l2_write_bytes == store_bytes
+    assert profile.memory_access.hbm_write_bytes == store_bytes
+
+
 def test_scalar_gemm_energy_does_not_charge_tensor_tile_padding() -> None:
     hardware = load_hardware(HARDWARE)
     profile = EffectiveRooflineModel().predict(
