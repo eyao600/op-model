@@ -2164,9 +2164,7 @@ def _diagnostics(
         for name, raw in raw_rates.items()
     }
     fixed_fraction = fixed_overhead_cycles / max(total_device_cycles, 1.0e-12)
-    shared_memory_bytes_per_cta = extended._shared_memory_bytes_per_cta(
-        problem, kernel, grid
-    )
+    shared_memory_bytes_per_cta = extended._shared_memory_bytes_per_cta(problem, kernel)
     phase_total = max(timeline.kernel_cycles, 1.0e-12)
     return {
         "problem": {

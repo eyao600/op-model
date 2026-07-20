@@ -24,6 +24,7 @@ from opmodel.models.effective_roofline import (
     _service_from_effective_rate,
     _sm_occupancy_classes,
     _warps_by_smsp,
+    evaluate_gemm_template_candidates,
 )
 from opmodel.registry import create_model
 
@@ -572,6 +573,34 @@ def test_tensor_gemm_energy_charges_padded_mma_events() -> None:
     )
     assert profile.energy_breakdown.compute_j == pytest.approx(
         event_flops * hardware.compute.tensor_energy_j_per_flop[DType.BF16]
+    )
+
+
+def test_catalogue_smem_legality_uses_k_invariant_resident_footprint() -> None:
+    hardware = load_hardware(A100_HARDWARE)
+    shallow = evaluate_gemm_template_candidates(
+        _gemm(256, 256, 64, attrs={}), hardware, shortlist_size=999
+    )
+    deep = evaluate_gemm_template_candidates(
+        _gemm(256, 256, 4096, attrs={}), hardware, shortlist_size=999
+    )
+
+    assert len(shallow) == len(deep) == 12
+    template_name = "sm80_128x128x32_64x64x32_4w3s"
+    shallow_candidate = next(
+        candidate for candidate in shallow if candidate.template.name == template_name
+    )
+    deep_candidate = next(
+        candidate for candidate in deep if candidate.template.name == template_name
+    )
+
+    shallow_kernel = shallow_candidate.profile.diagnostics["kernel"]
+    deep_kernel = deep_candidate.profile.diagnostics["kernel"]
+    assert shallow_kernel["shared_memory_bytes_per_cta"] == 49_152
+    assert deep_kernel["shared_memory_bytes_per_cta"] == 49_152
+    assert (
+        deep_candidate.profile.memory_access.sram_read_bytes
+        > shallow_candidate.profile.memory_access.sram_read_bytes
     )
 
 

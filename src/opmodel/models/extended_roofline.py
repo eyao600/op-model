@@ -903,8 +903,10 @@ def _template_is_legal(
             return False
     if hardware.compute.shared_memory_bytes_per_sm is not None:
         kernel = _kernel_from_template(template)
-        grid = _grid_accounting(problem, kernel)
-        if _shared_memory_bytes_per_cta(problem, kernel, grid) > hardware.compute.shared_memory_bytes_per_sm:
+        if (
+            _shared_memory_bytes_per_cta(problem, kernel)
+            > hardware.compute.shared_memory_bytes_per_sm
+        ):
             return False
     if hardware.compute.max_ctas_per_sm is not None and hardware.compute.max_ctas_per_sm <= 0:
         return False
@@ -931,7 +933,7 @@ def _cheap_template_score(
     tile_efficiency_penalty = 1.0 - grid.tile_efficiency
     objective_penalty = 0.0
     if objective == "energy":
-        smem_bytes = _shared_memory_bytes_per_cta(problem, kernel, grid)
+        smem_bytes = _shared_memory_bytes_per_cta(problem, kernel)
         objective_penalty = smem_bytes / max(1, template.pipeline_stages) / 131072.0
     return (
         4.0 * tile_efficiency_penalty
@@ -1184,8 +1186,21 @@ def _smem_load_per_cta_elements(
 def _shared_memory_bytes_per_cta(
     problem: GemmProblemSpec,
     kernel: GemmKernelSpec,
+) -> int:
+    """Resident pipelined A/B tile storage allocated by one CTA."""
+    stage_operand_bytes = _ceil_scalar_bytes(
+        (kernel.cta_m * kernel.cta_k + kernel.cta_k * kernel.cta_n)
+        * dtype_nbytes(problem.input_dtype)
+    )
+    return stage_operand_bytes * kernel.pipeline_stages
+
+
+def _smem_read_bytes_per_cta(
+    problem: GemmProblemSpec,
+    kernel: GemmKernelSpec,
     grid: GridAccounting | None = None,
 ) -> int:
+    """Cumulative S->R operand traffic for one CTA over the full K-loop."""
     return _ceil_scalar_bytes(
         _smem_load_per_cta_elements(problem, kernel, grid)
         * dtype_nbytes(problem.input_dtype)
@@ -1252,7 +1267,7 @@ def _traffic_accounting(
         (kernel.cta_m * kernel.cta_k + kernel.cta_k * kernel.cta_n) * dtype_bytes
     )
     smem_write = grid.cta_count * grid.k_stages * stage_operand_bytes
-    smem_read = grid.cta_count * _shared_memory_bytes_per_cta(problem, kernel, grid)
+    smem_read = grid.cta_count * _smem_read_bytes_per_cta(problem, kernel, grid)
     sram_read = smem_read if "sram" in hardware.memory_levels else None
     sram_write = 0 if "sram" in hardware.memory_levels else None
 
@@ -1326,7 +1341,7 @@ def _occupancy(
             smem_limit = max_ctas_limit
             warnings.append("shared_memory_bytes_per_sm_absent")
         else:
-            shared_memory_bytes_per_cta = _shared_memory_bytes_per_cta(problem, kernel, grid)
+            shared_memory_bytes_per_cta = _shared_memory_bytes_per_cta(problem, kernel)
             smem_limit = max(
                 1,
                 hardware.compute.shared_memory_bytes_per_sm
@@ -2342,9 +2357,8 @@ def _diagnostics(
     total_device_cycles = timeline.kernel_cycles + fixed_overhead_cycles
     fixed_overhead_fraction = fixed_overhead_cycles / max(total_device_cycles, 1.0e-12)
     smem_load_per_cta_elements = _smem_load_per_cta_elements(problem, kernel, grid)
-    shared_memory_bytes_per_cta = _ceil_scalar_bytes(
-        smem_load_per_cta_elements * dtype_nbytes(problem.input_dtype)
-    )
+    smem_read_bytes_per_cta = _smem_read_bytes_per_cta(problem, kernel, grid)
+    shared_memory_bytes_per_cta = _shared_memory_bytes_per_cta(problem, kernel)
     q_smem = traffic.smem_total_bytes + timeline.epilogue_smem_bytes
     q_l2 = traffic.l2_requested_bytes
     q_dram = traffic.dram_unique_bytes
@@ -2387,6 +2401,7 @@ def _diagnostics(
             "threads_per_cta": kernel.threads_per_cta,
             "registers_per_thread": kernel.registers_per_thread,
             "smem_load_per_cta_elements": smem_load_per_cta_elements,
+            "smem_read_bytes_per_cta": smem_read_bytes_per_cta,
             "shared_memory_bytes_per_cta": shared_memory_bytes_per_cta,
             "max_concurrent_ctas_per_sm": kernel.max_concurrent_ctas_per_sm,
             "slice_k": kernel.slice_k,
