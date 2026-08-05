@@ -17,6 +17,7 @@ class MemoryLevel:
     energy_j_per_byte: float
     energy_j_per_sector: float | None = None
     latency_s: float = 0.0
+    latency_cycles: float | None = None
     line_size_bytes: int | None = None
     sector_size_bytes: int | None = None
     bank_count: int | None = None
@@ -152,6 +153,7 @@ def _parse_hardware(data: Mapping[str, Any]) -> HardwareSpec:
             energy_j_per_byte=float(level_data.get("energy_j_per_byte", 0.0)),
             energy_j_per_sector=_optional_float(level_data.get("energy_j_per_sector")),
             latency_s=float(level_data.get("latency_s", 0.0)),
+            latency_cycles=_optional_float(level_data.get("latency_cycles")),
             line_size_bytes=_optional_int(level_data.get("line_size_bytes")),
             sector_size_bytes=_optional_int(level_data.get("sector_size_bytes")),
             bank_count=_optional_int(level_data.get("bank_count")),
@@ -220,18 +222,22 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
         "registers_per_sm",
         "shared_memory_bytes_per_sm",
         "max_async_copy_groups",
-        "tensor_latency_cycles",
-        "device_fixed_overhead_cycles",
     ):
         value = getattr(hardware.compute, field_name)
         if value is not None and value <= 0:
             raise ValueError(f"compute.{field_name} must be positive")
+    for field_name in ("tensor_latency_cycles", "device_fixed_overhead_cycles"):
+        value = getattr(hardware.compute, field_name)
+        if value is not None and value < 0:
+            raise ValueError(f"compute.{field_name} must be non-negative")
     if hardware.static_power_w < 0:
         raise ValueError("static_power_w must be non-negative")
     if hardware.energy_model is not None:
         _validate_energy_model(hardware.energy_model)
 
     for level in hardware.memory_levels.values():
+        if level.size_bytes is not None and level.size_bytes <= 0:
+            raise ValueError(f"Memory size_bytes for {level.name} must be positive")
         if level.bandwidth_bytes_per_s <= 0:
             raise ValueError(f"Memory bandwidth for {level.name} must be positive")
         if level.energy_j_per_byte < 0:
@@ -242,6 +248,10 @@ def _validate_hardware(hardware: HardwareSpec) -> None:
             )
         if level.latency_s < 0:
             raise ValueError(f"Memory latency for {level.name} must be non-negative")
+        if level.latency_cycles is not None and level.latency_cycles < 0:
+            raise ValueError(
+                f"Memory latency cycles for {level.name} must be non-negative"
+            )
         for field_name in (
             "line_size_bytes",
             "sector_size_bytes",

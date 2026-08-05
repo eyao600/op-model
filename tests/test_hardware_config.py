@@ -89,6 +89,28 @@ utilization:
         load_hardware(path)
 
 
+def test_nonpositive_memory_size_raises(tmp_path: Path) -> None:
+    path = tmp_path / "bad_size.yaml"
+    path.write_text(
+        """
+name: bad_size
+kind: gpu
+compute:
+  vector_flops_per_s:
+    bf16: 1.0
+memory:
+  levels:
+    - name: hbm
+      size_bytes: 0
+      bandwidth_bytes_per_s: 1.0
+      energy_j_per_byte: 0.0
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="size_bytes"):
+        load_hardware(path)
+
+
 def test_optional_base_hardware_fields_load(tmp_path: Path) -> None:
     path = tmp_path / "base_fields.yaml"
     path.write_text(

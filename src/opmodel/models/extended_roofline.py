@@ -127,6 +127,44 @@ class GridAccounting:
 
 
 @dataclass(frozen=True)
+class L2CapacityEstimate:
+    capacity_bytes: int | None
+    working_set_bytes: int
+    miss_fraction: float
+    a_dram_read_bytes: int
+    b_dram_read_bytes: int
+    a_capacity_miss_bytes: int
+    b_capacity_miss_bytes: int
+
+
+@dataclass(frozen=True)
+class L2ReuseFootprint:
+    peak_working_set_bytes: int
+    weighted_working_set_bytes: float
+    miss_fraction: float
+    k_window_stages: int
+    k_window_count: int
+    full_wave_full_window_bytes: int
+    full_wave_tail_window_bytes: int
+    last_wave_full_window_bytes: int
+    last_wave_tail_window_bytes: int
+
+
+@dataclass(frozen=True)
+class L2ReuseDistanceEstimate:
+    capacity_estimate: L2CapacityEstimate
+    a_within_wave_repeated_bytes: int
+    a_cross_wave_repeated_bytes: int
+    b_within_wave_repeated_bytes: int
+    b_cross_wave_repeated_bytes: int
+    within_wave_miss_fraction: float
+    a_cross_wave_reuse_distance_bytes: float
+    b_cross_wave_reuse_distance_bytes: float
+    a_cross_wave_miss_fraction: float
+    b_cross_wave_miss_fraction: float
+
+
+@dataclass(frozen=True)
 class TrafficAccounting:
     memory_access: MemoryAccess
     a_logical_bytes: int
@@ -137,10 +175,34 @@ class TrafficAccounting:
     b_l2_requested_bytes: int
     a_dram_unique_bytes: int
     b_dram_unique_bytes: int
+    a_dram_read_bytes: int
+    b_dram_read_bytes: int
     c_read_transaction_bytes: int
     d_store_transaction_bytes: int
     l2_requested_bytes: int
+    l2_capacity_bytes: int | None
+    l2_operation_working_set_bytes: int
+    l2_reuse_working_set_bytes: int
+    l2_weighted_reuse_working_set_bytes: float
+    l2_capacity_miss_fraction: float
+    l2_k_window_stages: int
+    l2_k_window_count: int
+    l2_full_wave_full_window_bytes: int
+    l2_full_wave_tail_window_bytes: int
+    l2_last_wave_full_window_bytes: int
+    l2_last_wave_tail_window_bytes: int
+    a_within_wave_repeated_bytes: int
+    a_cross_wave_repeated_bytes: int
+    b_within_wave_repeated_bytes: int
+    b_cross_wave_repeated_bytes: int
+    l2_within_wave_miss_fraction: float
+    a_cross_wave_reuse_distance_bytes: float
+    b_cross_wave_reuse_distance_bytes: float
+    a_cross_wave_miss_fraction: float
+    b_cross_wave_miss_fraction: float
+    dram_capacity_miss_bytes: int
     dram_unique_bytes: int
+    dram_total_bytes: int
     smem_read_bytes: int
     smem_write_bytes: int
     sector_size_bytes: int
@@ -601,8 +663,10 @@ def _estimate_gemm_with_kernel(
 ) -> OpProfile:
     clock_hz = _clock_hz(hardware, warnings)
     grid = _grid_accounting(problem, kernel)
-    traffic = _traffic_accounting(problem, kernel, grid, hardware, warnings)
     occupancy = _occupancy(problem, kernel, grid, hardware, warnings)
+    traffic = _traffic_accounting(
+        problem, kernel, grid, occupancy, hardware, warnings
+    )
     timeline = _timeline(problem, kernel, grid, traffic, occupancy, hardware, clock_hz, warnings)
     fixed_overhead_cycles = float(hardware.compute.device_fixed_overhead_cycles or 0)
     total_device_cycles = timeline.kernel_cycles + fixed_overhead_cycles
@@ -1207,10 +1271,404 @@ def _smem_read_bytes_per_cta(
     )
 
 
+def _count_periodic_indices(
+    *, start: int, count: int, period: int, target: int
+) -> int:
+    """Count one residue class in a consecutive integer interval in O(1)."""
+    if count <= 0:
+        return 0
+    first_offset = (target - start) % period
+    if first_offset >= count:
+        return 0
+    return 1 + (count - 1 - first_offset) // period
+
+
+def _cyclic_distinct_panel_counts(
+    *, start: int, request_count: int, panel_count: int
+) -> tuple[int, int]:
+    """Return full/tail panel counts in a consecutive cyclic request range."""
+    distinct = min(panel_count, max(0, request_count))
+    if distinct == 0:
+        return 0, 0
+    tail_offset = (panel_count - 1 - start) % panel_count
+    tail_count = 1 if tail_offset < distinct else 0
+    return distinct - tail_count, tail_count
+
+
+def _representative_wave_panel_counts(
+    *,
+    problem: GemmProblemSpec,
+    grid: GridAccounting,
+    start_cta: int,
+    active_ctas: int,
+) -> tuple[int, int, int, int]:
+    """Count distinct full/tail A and B panels in a row-major CTA range."""
+    if active_ctas <= 0:
+        return 0, 0, 0, 0
+
+    end_cta = start_cta + active_ctas - 1
+    first_a_panel = start_cta // grid.blocks_n
+    last_a_panel = end_cta // grid.blocks_n
+    a_panel_count = last_a_panel - first_a_panel + 1
+    a_tail_panels = _count_periodic_indices(
+        start=first_a_panel,
+        count=a_panel_count,
+        period=grid.blocks_m,
+        target=grid.blocks_m - 1,
+    )
+    a_full_panels = a_panel_count - a_tail_panels
+
+    if not problem.weight_is_batched:
+        b_full_panels, b_tail_panels = _cyclic_distinct_panel_counts(
+            start=start_cta % grid.blocks_n,
+            request_count=active_ctas,
+            panel_count=grid.blocks_n,
+        )
+        return a_full_panels, a_tail_panels, b_full_panels, b_tail_panels
+
+    ctas_per_batch = grid.blocks_m * grid.blocks_n
+    first_batch = start_cta // ctas_per_batch
+    last_batch = end_cta // ctas_per_batch
+    if first_batch == last_batch:
+        b_full_panels, b_tail_panels = _cyclic_distinct_panel_counts(
+            start=start_cta % grid.blocks_n,
+            request_count=active_ctas,
+            panel_count=grid.blocks_n,
+        )
+        return a_full_panels, a_tail_panels, b_full_panels, b_tail_panels
+
+    first_batch_requests = ctas_per_batch - start_cta % ctas_per_batch
+    last_batch_requests = end_cta % ctas_per_batch + 1
+    interior_batches = max(0, last_batch - first_batch - 1)
+    first_full, first_tail = _cyclic_distinct_panel_counts(
+        start=start_cta % grid.blocks_n,
+        request_count=first_batch_requests,
+        panel_count=grid.blocks_n,
+    )
+    last_full, last_tail = _cyclic_distinct_panel_counts(
+        start=0,
+        request_count=last_batch_requests,
+        panel_count=grid.blocks_n,
+    )
+    b_full_panels = first_full + last_full + interior_batches * (grid.blocks_n - 1)
+    b_tail_panels = first_tail + last_tail + interior_batches
+    return a_full_panels, a_tail_panels, b_full_panels, b_tail_panels
+
+
+def _representative_l2_window_bytes(
+    *,
+    problem: GemmProblemSpec,
+    kernel: GemmKernelSpec,
+    grid: GridAccounting,
+    start_cta: int,
+    active_ctas: int,
+    k_lengths: tuple[int, ...],
+    dtype_bytes: float,
+    line_size: int,
+) -> int:
+    a_full, a_tail, b_full, b_tail = _representative_wave_panel_counts(
+        problem=problem,
+        grid=grid,
+        start_cta=start_cta,
+        active_ctas=active_ctas,
+    )
+    tail_m = problem.m - (grid.blocks_m - 1) * kernel.cta_m
+    tail_n = problem.n - (grid.blocks_n - 1) * kernel.cta_n
+
+    def panel_bytes(full_count: int, tail_count: int, full_extent: int, tail_extent: int) -> int:
+        return sum(
+            full_count
+            * _sector_round_bytes(full_extent * k_len * dtype_bytes, line_size)
+            + tail_count
+            * _sector_round_bytes(tail_extent * k_len * dtype_bytes, line_size)
+            for k_len in k_lengths
+        )
+
+    return panel_bytes(a_full, a_tail, kernel.cta_m, tail_m) + panel_bytes(
+        b_full, b_tail, kernel.cta_n, tail_n
+    )
+
+
+def _l2_reuse_footprint(
+    *,
+    problem: GemmProblemSpec,
+    kernel: GemmKernelSpec,
+    grid: GridAccounting,
+    occupancy: OccupancyResult,
+    k_tiles: tuple[int, ...],
+    capacity_bytes: int | None,
+    dtype_bytes: float,
+    line_size: int,
+) -> L2ReuseFootprint:
+    """Estimate capacity pressure from four representative wave/K-window classes."""
+    k_window_stages = max(1, min(grid.k_stages, kernel.pipeline_stages))
+    k_window_count = _ceil_div(grid.k_stages, k_window_stages)
+    full_k_window_count = max(0, k_window_count - 1)
+    full_k_lengths = k_tiles[:k_window_stages]
+    tail_k_lengths = k_tiles[full_k_window_count * k_window_stages :]
+
+    full_wave_count = max(0, occupancy.wave_count - 1)
+    last_wave_start = full_wave_count * occupancy.ctas_per_wave
+    wave_classes = (
+        (
+            full_wave_count,
+            0,
+            occupancy.full_wave_ctas,
+            "full",
+        ),
+        (1, last_wave_start, occupancy.last_wave_ctas, "last"),
+    )
+    k_classes = (
+        (full_k_window_count, full_k_lengths, "full"),
+        (1, tail_k_lengths, "tail"),
+    )
+
+    footprints = {
+        ("full", "full"): 0,
+        ("full", "tail"): 0,
+        ("last", "full"): 0,
+        ("last", "tail"): 0,
+    }
+    weighted_footprint = 0.0
+    weighted_miss_fraction = 0.0
+    total_weight = 0.0
+    peak_working_set = 0
+    for wave_occurrences, start_cta, active_ctas, wave_name in wave_classes:
+        for k_occurrences, k_lengths, k_name in k_classes:
+            if wave_occurrences <= 0 or k_occurrences <= 0 or not k_lengths:
+                continue
+            working_set = _representative_l2_window_bytes(
+                problem=problem,
+                kernel=kernel,
+                grid=grid,
+                start_cta=start_cta,
+                active_ctas=active_ctas,
+                k_lengths=k_lengths,
+                dtype_bytes=dtype_bytes,
+                line_size=line_size,
+            )
+            footprints[(wave_name, k_name)] = working_set
+            peak_working_set = max(peak_working_set, working_set)
+            weight = float(
+                wave_occurrences
+                * k_occurrences
+                * active_ctas
+                * sum(k_lengths)
+            )
+            miss_fraction = 0.0
+            if capacity_bytes is not None and working_set > capacity_bytes:
+                miss_fraction = _clamp01(1.0 - capacity_bytes / working_set)
+            weighted_footprint += weight * working_set
+            weighted_miss_fraction += weight * miss_fraction
+            total_weight += weight
+
+    return L2ReuseFootprint(
+        peak_working_set_bytes=peak_working_set,
+        weighted_working_set_bytes=(weighted_footprint / total_weight if total_weight else 0.0),
+        miss_fraction=(weighted_miss_fraction / total_weight if total_weight else 0.0),
+        k_window_stages=k_window_stages,
+        k_window_count=k_window_count,
+        full_wave_full_window_bytes=footprints[("full", "full")],
+        full_wave_tail_window_bytes=footprints[("full", "tail")],
+        last_wave_full_window_bytes=footprints[("last", "full")],
+        last_wave_tail_window_bytes=footprints[("last", "tail")],
+    )
+
+
+def _l2_capacity_estimate(
+    *,
+    a_requested_bytes: int,
+    b_requested_bytes: int,
+    a_unique_bytes: int,
+    b_unique_bytes: int,
+    working_set_bytes: int,
+    capacity_bytes: int | None,
+    sector_size_bytes: int,
+    capacity_miss_fraction: float | None = None,
+) -> L2CapacityEstimate:
+    """Bound DRAM reads between compulsory first touches and all L2 requests."""
+    if capacity_miss_fraction is None:
+        miss_fraction = 0.0
+        if capacity_bytes is not None and working_set_bytes > capacity_bytes:
+            miss_fraction = _clamp01(1.0 - capacity_bytes / working_set_bytes)
+    else:
+        miss_fraction = _clamp01(capacity_miss_fraction)
+
+    def actual_read(requested: int, unique: int) -> int:
+        repeated = max(0, requested - unique)
+        capacity_miss = min(
+            repeated,
+            _sector_round_bytes(repeated * miss_fraction, sector_size_bytes),
+        )
+        return min(requested, unique + capacity_miss)
+
+    a_dram_read = actual_read(a_requested_bytes, a_unique_bytes)
+    b_dram_read = actual_read(b_requested_bytes, b_unique_bytes)
+    return L2CapacityEstimate(
+        capacity_bytes=capacity_bytes,
+        working_set_bytes=working_set_bytes,
+        miss_fraction=miss_fraction,
+        a_dram_read_bytes=a_dram_read,
+        b_dram_read_bytes=b_dram_read,
+        a_capacity_miss_bytes=a_dram_read - a_unique_bytes,
+        b_capacity_miss_bytes=b_dram_read - b_unique_bytes,
+    )
+
+
+def _hybrid_l2_reuse_distance_estimate(
+    *,
+    problem: GemmProblemSpec,
+    kernel: GemmKernelSpec,
+    grid: GridAccounting,
+    occupancy: OccupancyResult,
+    reuse_footprint: L2ReuseFootprint,
+    k_tiles: tuple[int, ...],
+    a_requested_bytes: int,
+    b_requested_bytes: int,
+    a_unique_bytes: int,
+    b_unique_bytes: int,
+    c_read_bytes: int,
+    d_store_bytes: int,
+    operation_working_set_bytes: int,
+    capacity_bytes: int | None,
+    dtype_bytes: float,
+    sector_size_bytes: int,
+    line_size_bytes: int,
+) -> L2ReuseDistanceEstimate:
+    """Combine bounded wave-local pressure with analytical cross-wave reuse distance."""
+    a_repeated = max(0, a_requested_bytes - a_unique_bytes)
+    b_repeated = max(0, b_requested_bytes - b_unique_bytes)
+    a_cross_share = 0.0
+    b_cross_share = 0.0
+    if occupancy.wave_count > 1:
+        wave_boundaries = occupancy.wave_count - 1
+        a_group_aligned_boundaries = (
+            (grid.cta_count - 1)
+            // math.lcm(occupancy.ctas_per_wave, grid.blocks_n)
+        )
+        a_cross_events = max(0, wave_boundaries - a_group_aligned_boundaries)
+        a_repeat_events = problem.batch * grid.blocks_m * max(0, grid.blocks_n - 1)
+        if a_repeat_events > 0:
+            a_cross_share = _clamp01(a_cross_events / a_repeat_events)
+        if b_repeated > 0:
+            b_cross_share = _clamp01(grid.blocks_n / occupancy.ctas_per_wave)
+
+    def split_repeated(repeated: int, cross_share: float) -> tuple[int, int]:
+        cross = min(
+            repeated,
+            _sector_round_bytes(repeated * cross_share, sector_size_bytes),
+        )
+        return repeated - cross, cross
+
+    a_within, a_cross = split_repeated(a_repeated, a_cross_share)
+    b_within, b_cross = split_repeated(b_repeated, b_cross_share)
+
+    full_wave_all_k_bytes = 0
+    wave_output_bytes = 0
+    if occupancy.wave_count > 1:
+        full_wave_all_k_bytes = _representative_l2_window_bytes(
+            problem=problem,
+            kernel=kernel,
+            grid=grid,
+            start_cta=0,
+            active_ctas=occupancy.full_wave_ctas,
+            k_lengths=k_tiles,
+            dtype_bytes=dtype_bytes,
+            line_size=line_size_bytes,
+        )
+        wave_output_bytes = _sector_round_bytes(
+            (c_read_bytes + d_store_bytes)
+            * occupancy.full_wave_ctas
+            / max(1, grid.cta_count),
+            line_size_bytes,
+        )
+    a_cross_distance = float(full_wave_all_k_bytes + wave_output_bytes)
+    b_wave_gap = max(1.0, grid.blocks_n / max(1, occupancy.ctas_per_wave))
+    b_cross_distance = a_cross_distance * b_wave_gap
+
+    # Capacity misses are meaningful only after the operation's unique tensor
+    # footprint exceeds the configured L2 capacity. The wave-local footprint
+    # describes one scheduling window and can remain below capacity even while
+    # successive windows evict data reused by later waves. Reuse distance
+    # refines miss attribution only after operation-level pressure exists.
+    capacity_active = (
+        capacity_bytes is not None
+        and operation_working_set_bytes > capacity_bytes
+    )
+
+    def reuse_distance_miss_fraction(distance: float) -> float:
+        if not capacity_active or capacity_bytes is None or distance <= capacity_bytes:
+            return 0.0
+        # The fraction of a reuse interval that cannot remain resident is the
+        # overflow beyond L2 capacity. This keeps the model continuous at the
+        # capacity boundary without a fitted threshold or miss-rate parameter.
+        operation_pressure = _clamp01(
+            1.0 - capacity_bytes / operation_working_set_bytes
+        )
+        reuse_interval_pressure = _clamp01(1.0 - capacity_bytes / distance)
+        return operation_pressure * reuse_interval_pressure
+
+    a_cross_miss_fraction = reuse_distance_miss_fraction(a_cross_distance)
+    b_cross_miss_fraction = reuse_distance_miss_fraction(b_cross_distance)
+    within_miss_fraction = reuse_footprint.miss_fraction
+
+    def actual_read(
+        *, unique: int, requested: int, within: int, cross: int, cross_fraction: float
+    ) -> tuple[int, int]:
+        within_miss = _sector_round_bytes(
+            within * within_miss_fraction, sector_size_bytes
+        )
+        cross_miss = _sector_round_bytes(cross * cross_fraction, sector_size_bytes)
+        capacity_miss = min(max(0, requested - unique), within_miss + cross_miss)
+        read = min(requested, unique + capacity_miss)
+        return read, read - unique
+
+    a_dram_read, a_capacity_miss = actual_read(
+        unique=a_unique_bytes,
+        requested=a_requested_bytes,
+        within=a_within,
+        cross=a_cross,
+        cross_fraction=a_cross_miss_fraction,
+    )
+    b_dram_read, b_capacity_miss = actual_read(
+        unique=b_unique_bytes,
+        requested=b_requested_bytes,
+        within=b_within,
+        cross=b_cross,
+        cross_fraction=b_cross_miss_fraction,
+    )
+    repeated_total = a_repeated + b_repeated
+    capacity_miss_total = a_capacity_miss + b_capacity_miss
+    capacity_estimate = L2CapacityEstimate(
+        capacity_bytes=capacity_bytes,
+        working_set_bytes=operation_working_set_bytes,
+        miss_fraction=(
+            capacity_miss_total / repeated_total if repeated_total else 0.0
+        ),
+        a_dram_read_bytes=a_dram_read,
+        b_dram_read_bytes=b_dram_read,
+        a_capacity_miss_bytes=a_capacity_miss,
+        b_capacity_miss_bytes=b_capacity_miss,
+    )
+    return L2ReuseDistanceEstimate(
+        capacity_estimate=capacity_estimate,
+        a_within_wave_repeated_bytes=a_within,
+        a_cross_wave_repeated_bytes=a_cross,
+        b_within_wave_repeated_bytes=b_within,
+        b_cross_wave_repeated_bytes=b_cross,
+        within_wave_miss_fraction=within_miss_fraction,
+        a_cross_wave_reuse_distance_bytes=a_cross_distance,
+        b_cross_wave_reuse_distance_bytes=b_cross_distance,
+        a_cross_wave_miss_fraction=a_cross_miss_fraction,
+        b_cross_wave_miss_fraction=b_cross_miss_fraction,
+    )
+
+
 def _traffic_accounting(
     problem: GemmProblemSpec,
     kernel: GemmKernelSpec,
     grid: GridAccounting,
+    occupancy: OccupancyResult,
     hardware: HardwareSpec,
     warnings: list[str],
 ) -> TrafficAccounting:
@@ -1255,12 +1713,79 @@ def _traffic_accounting(
     l2_read = a_requested_tx + b_requested_tx + c_read_tx if l2_level is not None else None
     l2_write = d_store_tx if l2_level is not None else None
     l2_to_smem_bytes = a_requested_tx + b_requested_tx if l2_level is not None else None
+    l2_capacity = l2_level.size_bytes if l2_level is not None else None
+    reuse_footprint = _l2_reuse_footprint(
+        problem=problem,
+        kernel=kernel,
+        grid=grid,
+        occupancy=occupancy,
+        k_tiles=k_tiles,
+        capacity_bytes=l2_capacity,
+        dtype_bytes=dtype_bytes,
+        line_size=line_size,
+    )
+    # Capacity activation uses one representative batch element. Independent
+    # batch items do not become one monolithic cache-resident tensor merely
+    # because they share a launch; broadcast weights remain shared.
+    representative_batches = max(1, problem.batch)
+    operation_working_set = (
+        a_unique_dram_tx // representative_batches
+        + b_unique_one_batch_tx
+        + max(c_read_tx, d_store_tx) // representative_batches
+    )
     if l2_level is None:
         hbm_read = a_requested_tx + b_requested_tx + c_read_tx
         hbm_write = d_store_tx
+        capacity_estimate = L2CapacityEstimate(
+            capacity_bytes=None,
+            working_set_bytes=reuse_footprint.peak_working_set_bytes,
+            miss_fraction=1.0,
+            a_dram_read_bytes=a_requested_tx,
+            b_dram_read_bytes=b_requested_tx,
+            a_capacity_miss_bytes=max(0, a_requested_tx - a_unique_dram_tx),
+            b_capacity_miss_bytes=max(0, b_requested_tx - b_unique_dram_tx),
+        )
+        reuse_distance_estimate = L2ReuseDistanceEstimate(
+            capacity_estimate=capacity_estimate,
+            a_within_wave_repeated_bytes=max(0, a_requested_tx - a_unique_dram_tx),
+            a_cross_wave_repeated_bytes=0,
+            b_within_wave_repeated_bytes=max(0, b_requested_tx - b_unique_dram_tx),
+            b_cross_wave_repeated_bytes=0,
+            within_wave_miss_fraction=1.0,
+            a_cross_wave_reuse_distance_bytes=0.0,
+            b_cross_wave_reuse_distance_bytes=0.0,
+            a_cross_wave_miss_fraction=1.0,
+            b_cross_wave_miss_fraction=1.0,
+        )
         warnings.append("l2_level_absent_dram_uses_cta_requested_traffic")
     else:
-        hbm_read = a_unique_dram_tx + b_unique_dram_tx + c_read_tx
+        if l2_capacity is None:
+            warnings.append("l2_size_bytes_absent_dram_uses_unique_first_touch")
+        reuse_distance_estimate = _hybrid_l2_reuse_distance_estimate(
+            problem=problem,
+            kernel=kernel,
+            grid=grid,
+            occupancy=occupancy,
+            reuse_footprint=reuse_footprint,
+            k_tiles=k_tiles,
+            a_requested_bytes=a_requested_tx,
+            b_requested_bytes=b_requested_tx,
+            a_unique_bytes=a_unique_dram_tx,
+            b_unique_bytes=b_unique_dram_tx,
+            c_read_bytes=c_read_tx,
+            d_store_bytes=d_store_tx,
+            operation_working_set_bytes=operation_working_set,
+            capacity_bytes=l2_capacity,
+            dtype_bytes=dtype_bytes,
+            sector_size_bytes=sector_size,
+            line_size_bytes=line_size,
+        )
+        capacity_estimate = reuse_distance_estimate.capacity_estimate
+        hbm_read = (
+            capacity_estimate.a_dram_read_bytes
+            + capacity_estimate.b_dram_read_bytes
+            + c_read_tx
+        )
         hbm_write = d_store_tx
 
     stage_operand_bytes = _ceil_scalar_bytes(
@@ -1275,8 +1800,8 @@ def _traffic_accounting(
         memory_access=MemoryAccess(
             hbm_read_bytes=hbm_read,
             hbm_write_bytes=hbm_write,
-            l2_read_bytes=l2_to_smem_bytes,
-            l2_write_bytes=0 if l2_level is not None else None,
+            l2_read_bytes=(l2_to_smem_bytes + c_read_tx) if l2_level is not None else None,
+            l2_write_bytes=d_store_tx if l2_level is not None else None,
             sram_read_bytes=sram_read,
             sram_write_bytes=sram_write,
         ),
@@ -1299,10 +1824,53 @@ def _traffic_accounting(
         b_l2_requested_bytes=b_requested_tx,
         a_dram_unique_bytes=a_unique_dram_tx,
         b_dram_unique_bytes=b_unique_dram_tx,
+        a_dram_read_bytes=capacity_estimate.a_dram_read_bytes,
+        b_dram_read_bytes=capacity_estimate.b_dram_read_bytes,
         c_read_transaction_bytes=c_read_tx,
         d_store_transaction_bytes=d_store_tx,
         l2_requested_bytes=l2_to_smem_bytes or 0,
-        dram_unique_bytes=hbm_read + hbm_write,
+        l2_capacity_bytes=l2_capacity,
+        l2_operation_working_set_bytes=operation_working_set,
+        l2_reuse_working_set_bytes=reuse_footprint.peak_working_set_bytes,
+        l2_weighted_reuse_working_set_bytes=reuse_footprint.weighted_working_set_bytes,
+        l2_capacity_miss_fraction=capacity_estimate.miss_fraction,
+        l2_k_window_stages=reuse_footprint.k_window_stages,
+        l2_k_window_count=reuse_footprint.k_window_count,
+        l2_full_wave_full_window_bytes=reuse_footprint.full_wave_full_window_bytes,
+        l2_full_wave_tail_window_bytes=reuse_footprint.full_wave_tail_window_bytes,
+        l2_last_wave_full_window_bytes=reuse_footprint.last_wave_full_window_bytes,
+        l2_last_wave_tail_window_bytes=reuse_footprint.last_wave_tail_window_bytes,
+        a_within_wave_repeated_bytes=(
+            reuse_distance_estimate.a_within_wave_repeated_bytes
+        ),
+        a_cross_wave_repeated_bytes=reuse_distance_estimate.a_cross_wave_repeated_bytes,
+        b_within_wave_repeated_bytes=(
+            reuse_distance_estimate.b_within_wave_repeated_bytes
+        ),
+        b_cross_wave_repeated_bytes=reuse_distance_estimate.b_cross_wave_repeated_bytes,
+        l2_within_wave_miss_fraction=(
+            reuse_distance_estimate.within_wave_miss_fraction
+        ),
+        a_cross_wave_reuse_distance_bytes=(
+            reuse_distance_estimate.a_cross_wave_reuse_distance_bytes
+        ),
+        b_cross_wave_reuse_distance_bytes=(
+            reuse_distance_estimate.b_cross_wave_reuse_distance_bytes
+        ),
+        a_cross_wave_miss_fraction=(
+            reuse_distance_estimate.a_cross_wave_miss_fraction
+        ),
+        b_cross_wave_miss_fraction=(
+            reuse_distance_estimate.b_cross_wave_miss_fraction
+        ),
+        dram_capacity_miss_bytes=(
+            capacity_estimate.a_capacity_miss_bytes
+            + capacity_estimate.b_capacity_miss_bytes
+        ),
+        dram_unique_bytes=(
+            a_unique_dram_tx + b_unique_dram_tx + c_read_tx + hbm_write
+        ),
+        dram_total_bytes=hbm_read + hbm_write,
         smem_read_bytes=smem_read,
         smem_write_bytes=0,
         sector_size_bytes=sector_size,
@@ -1423,7 +1991,7 @@ def _timeline(
         else 0.0
     )
     avg_dram_load_bytes_per_cta_stage = (
-        (traffic.a_dram_unique_bytes + traffic.b_dram_unique_bytes) / load_stage_count
+        (traffic.a_dram_read_bytes + traffic.b_dram_read_bytes) / load_stage_count
     )
 
     full_wave = _wave_pipeline(
@@ -1505,7 +2073,7 @@ def _timeline(
         if l2_level is not None
         else 0.0
     )
-    dram_active = traffic.dram_unique_bytes / max(peak_hbm_bw_per_cycle, 1.0e-12)
+    dram_active = traffic.dram_total_bytes / max(peak_hbm_bw_per_cycle, 1.0e-12)
     compute_issue_util = _clamp01(
         full_wave.math_issue_group_cycles / max(full_wave.math_group_cycles, 1.0e-12)
     )
@@ -2229,7 +2797,7 @@ def _roofline_metrics(
 ) -> dict[str, Any]:
     q_smem = traffic.smem_total_bytes + timeline.epilogue_smem_bytes
     q_l2 = traffic.l2_requested_bytes
-    q_dram = traffic.dram_unique_bytes
+    q_dram = traffic.dram_total_bytes
     useful = grid.useful_flops
     issued = grid.issued_flops
     achieved_kernel = useful / max(timeline.kernel_cycles, 1.0e-12)
@@ -2361,7 +2929,7 @@ def _diagnostics(
     shared_memory_bytes_per_cta = _shared_memory_bytes_per_cta(problem, kernel)
     q_smem = traffic.smem_total_bytes + timeline.epilogue_smem_bytes
     q_l2 = traffic.l2_requested_bytes
-    q_dram = traffic.dram_unique_bytes
+    q_dram = traffic.dram_total_bytes
     useful = grid.useful_flops
     total_q = q_smem + q_l2 + q_dram
     roofline_metrics = _roofline_metrics(
@@ -2452,10 +3020,40 @@ def _diagnostics(
             "b_l2_requested": traffic.b_l2_requested_bytes,
             "a_dram_unique": traffic.a_dram_unique_bytes,
             "b_dram_unique": traffic.b_dram_unique_bytes,
+            "a_dram_read": traffic.a_dram_read_bytes,
+            "b_dram_read": traffic.b_dram_read_bytes,
             "c_read": traffic.c_read_transaction_bytes,
             "d_store": traffic.d_store_transaction_bytes,
             "l2_requested": traffic.l2_requested_bytes,
+            "l2_capacity": traffic.l2_capacity_bytes,
+            "l2_operation_working_set": traffic.l2_operation_working_set_bytes,
+            "l2_reuse_working_set": traffic.l2_reuse_working_set_bytes,
+            "l2_weighted_reuse_working_set": (
+                traffic.l2_weighted_reuse_working_set_bytes
+            ),
+            "l2_capacity_miss_fraction": traffic.l2_capacity_miss_fraction,
+            "l2_k_window_stages": traffic.l2_k_window_stages,
+            "l2_k_window_count": traffic.l2_k_window_count,
+            "l2_reuse_windows": {
+                "full_wave_full_k": traffic.l2_full_wave_full_window_bytes,
+                "full_wave_tail_k": traffic.l2_full_wave_tail_window_bytes,
+                "last_wave_full_k": traffic.l2_last_wave_full_window_bytes,
+                "last_wave_tail_k": traffic.l2_last_wave_tail_window_bytes,
+            },
+            "l2_reuse_distance": {
+                "a_within_wave_repeated": traffic.a_within_wave_repeated_bytes,
+                "a_cross_wave_repeated": traffic.a_cross_wave_repeated_bytes,
+                "b_within_wave_repeated": traffic.b_within_wave_repeated_bytes,
+                "b_cross_wave_repeated": traffic.b_cross_wave_repeated_bytes,
+                "within_wave_miss_fraction": traffic.l2_within_wave_miss_fraction,
+                "a_cross_wave_bytes": traffic.a_cross_wave_reuse_distance_bytes,
+                "b_cross_wave_bytes": traffic.b_cross_wave_reuse_distance_bytes,
+                "a_cross_wave_miss_fraction": traffic.a_cross_wave_miss_fraction,
+                "b_cross_wave_miss_fraction": traffic.b_cross_wave_miss_fraction,
+            },
+            "dram_capacity_miss": traffic.dram_capacity_miss_bytes,
             "dram_unique": traffic.dram_unique_bytes,
+            "dram_total": traffic.dram_total_bytes,
             "smem_read": traffic.smem_read_bytes,
             "smem_write": traffic.smem_write_bytes,
             "epilogue_smem": timeline.epilogue_smem_bytes,
@@ -2545,8 +3143,12 @@ def _diagnostics(
         "warnings": all_warnings,
         "assumptions": (
             "deterministic_tiled_gemm_access_pattern",
-            "first_touch_l2_reuse_when_l2_exists",
-            "dram_unique_first_touch_plus_output_writeback",
+            "row_major_cta_launch_order_for_l2_reuse",
+            "representative_full_last_wave_k_window_l2_capacity_model",
+            "analytical_a_b_cross_wave_reuse_distance_buckets",
+            "bounded_l2_capacity_miss_approximation",
+            "dram_unique_is_compulsory_lower_bound",
+            "dram_total_includes_capacity_misses_and_output_writeback",
             "artifact_style_full_last_wave_pipeline",
         )
         + (
@@ -2640,6 +3242,8 @@ def _debug_trace(
             f"D store bytes: {traffic.d_store_logical_bytes}",
             f"L2 requested bytes: {traffic.l2_requested_bytes}",
             f"DRAM unique bytes: {traffic.dram_unique_bytes}",
+            f"DRAM capacity miss bytes: {traffic.dram_capacity_miss_bytes}",
+            f"DRAM total bytes: {traffic.dram_total_bytes}",
             f"SMEM bytes: {traffic.smem_total_bytes + timeline.epilogue_smem_bytes:.4g}",
             f"compute stage cycles: {timeline.compute_stage_cycles:.4g}",
             f"SMEM stage cycles: {timeline.smem_stage_cycles:.4g}",
@@ -2705,6 +3309,8 @@ def _shared_latency_cycles(
     hardware: HardwareSpec, clock_hz: float, warnings: list[str]
 ) -> float:
     sram = hardware.memory_levels.get("sram")
+    if sram is not None and sram.latency_cycles is not None:
+        return float(sram.latency_cycles)
     if sram is not None and sram.latency_s > 0.0:
         return sram.latency_s * clock_hz
     _append_warning_once(warnings, "shared_latency_cycles_default_29")
@@ -2714,6 +3320,8 @@ def _shared_latency_cycles(
 def _memory_latency_cycles(
     level: MemoryLevel, clock_hz: float, name: str, default_cycles: float, warnings: list[str]
 ) -> float:
+    if level.latency_cycles is not None:
+        return float(level.latency_cycles)
     if level.latency_s > 0.0:
         return level.latency_s * clock_hz
     _append_warning_once(warnings, f"{name}_latency_cycles_default_{default_cycles:g}")

@@ -26,6 +26,10 @@ from opmodel.models.effective_roofline import (
     _warps_by_smsp,
     evaluate_gemm_template_candidates,
 )
+from opmodel.models.extended_roofline import (
+    ExtendedRooflineModel,
+    _l2_capacity_estimate,
+)
 from opmodel.registry import create_model
 
 
@@ -573,6 +577,286 @@ def test_tensor_gemm_energy_charges_padded_mma_events() -> None:
     )
     assert profile.energy_breakdown.compute_j == pytest.approx(
         event_flops * hardware.compute.tensor_energy_j_per_flop[DType.BF16]
+    )
+
+
+def test_l2_capacity_estimate_is_bounded_and_transaction_rounded() -> None:
+    no_pressure = _l2_capacity_estimate(
+        a_requested_bytes=1_000,
+        b_requested_bytes=600,
+        a_unique_bytes=100,
+        b_unique_bytes=200,
+        working_set_bytes=1_000,
+        capacity_bytes=1_000,
+        sector_size_bytes=1,
+    )
+    pressure = _l2_capacity_estimate(
+        a_requested_bytes=1_000,
+        b_requested_bytes=600,
+        a_unique_bytes=100,
+        b_unique_bytes=200,
+        working_set_bytes=1_000,
+        capacity_bytes=250,
+        sector_size_bytes=32,
+    )
+    all_miss = _l2_capacity_estimate(
+        a_requested_bytes=1_000,
+        b_requested_bytes=600,
+        a_unique_bytes=100,
+        b_unique_bytes=200,
+        working_set_bytes=1_000,
+        capacity_bytes=0,
+        sector_size_bytes=32,
+    )
+
+    assert no_pressure.miss_fraction == 0.0
+    assert no_pressure.a_dram_read_bytes == 100
+    assert no_pressure.b_dram_read_bytes == 200
+    assert pressure.miss_fraction == pytest.approx(0.75)
+    assert pressure.a_dram_read_bytes == 804
+    assert pressure.b_dram_read_bytes == 520
+    assert all_miss.a_dram_read_bytes == 1_000
+    assert all_miss.b_dram_read_bytes == 600
+
+
+def test_gemm_l2_capacity_misses_feed_both_roofline_models() -> None:
+    hardware = load_hardware(HARDWARE)
+    # Keep the grid to one CTA wave so this isolates the representative
+    # pipeline-window term from the analytical cross-wave reuse-distance term.
+    op = _gemm(512, 512, 1024)
+    probe = ExtendedRooflineModel().predict(op, hardware)
+    working_set = probe.diagnostics["transaction_bytes"]["l2_reuse_working_set"]
+    l2 = hardware.memory_levels["l2"]
+    full_capacity = replace(
+        hardware,
+        memory_levels={
+            **hardware.memory_levels,
+            "l2": replace(l2, size_bytes=working_set),
+        },
+    )
+    constrained = replace(
+        hardware,
+        memory_levels={
+            **hardware.memory_levels,
+            "l2": replace(l2, size_bytes=working_set // 4),
+        },
+    )
+
+    observed_traffic: list[tuple[int, int, int, float]] = []
+    for model_name in ("extended_roofline", "effective_roofline"):
+        baseline = create_model(model_name).predict(op, full_capacity)
+        pressured = create_model(model_name).predict(op, constrained)
+        base_tx = baseline.diagnostics["transaction_bytes"]
+        pressure_tx = pressured.diagnostics["transaction_bytes"]
+
+        assert base_tx["l2_capacity_miss_fraction"] == 0.0
+        assert base_tx["dram_total"] == base_tx["dram_unique"]
+        assert 0.0 < pressure_tx["l2_capacity_miss_fraction"] <= 0.75
+        assert pressure_tx["l2_weighted_reuse_working_set"] <= pressure_tx[
+            "l2_reuse_working_set"
+        ]
+        assert pressure_tx["l2_k_window_stages"] == 3
+        assert pressure_tx["l2_k_window_count"] == math.ceil(32 / 3)
+        assert max(pressure_tx["l2_reuse_windows"].values()) == working_set
+        assert pressure_tx["l2_reuse_distance"]["a_cross_wave_repeated"] == 0
+        assert pressure_tx["l2_reuse_distance"]["b_cross_wave_repeated"] == 0
+        assert pressure_tx["dram_unique"] < pressure_tx["dram_total"]
+        assert pressure_tx["a_dram_unique"] <= pressure_tx["a_dram_read"]
+        assert pressure_tx["a_dram_read"] <= pressure_tx["a_l2_requested"]
+        assert pressure_tx["b_dram_unique"] <= pressure_tx["b_dram_read"]
+        assert pressure_tx["b_dram_read"] <= pressure_tx["b_l2_requested"]
+        assert pressured.memory_access.hbm_read_bytes > baseline.memory_access.hbm_read_bytes
+        assert pressured.energy_breakdown.hbm_j > baseline.energy_breakdown.hbm_j
+        assert pressured.latency_s >= baseline.latency_s
+        assert (
+            pressured.diagnostics["stage_cycles"]["dram_service"]
+            > baseline.diagnostics["stage_cycles"]["dram_service"]
+        )
+        observed_traffic.append(
+            (
+                pressure_tx["a_dram_read"],
+                pressure_tx["b_dram_read"],
+                pressure_tx["dram_total"],
+                pressure_tx["l2_capacity_miss_fraction"],
+            )
+        )
+    assert observed_traffic[0] == observed_traffic[1]
+
+
+def test_gemm_cross_wave_reuse_distance_requires_operation_working_set_pressure() -> None:
+    hardware = load_hardware(HARDWARE)
+    observed_traffic: list[tuple[int, int, int, float]] = []
+    for model_name in ("extended_roofline", "effective_roofline"):
+        model = create_model(model_name)
+        shallow = model.predict(_gemm(4096, 4096, 64), hardware)
+        deep = model.predict(_gemm(4096, 4096, 1024), hardware)
+        shallow_tx = shallow.diagnostics["transaction_bytes"]
+        deep_tx = deep.diagnostics["transaction_bytes"]
+        shallow_rd = shallow_tx["l2_reuse_distance"]
+        deep_rd = deep_tx["l2_reuse_distance"]
+        capacity = hardware.memory_levels["l2"].size_bytes
+
+        assert shallow_rd["within_wave_miss_fraction"] == 0.0
+        assert deep_rd["within_wave_miss_fraction"] == 0.0
+        assert shallow_rd["a_cross_wave_miss_fraction"] == 0.0
+        assert shallow_rd["b_cross_wave_miss_fraction"] == 0.0
+        assert deep_tx["l2_reuse_working_set"] < capacity
+        assert deep_tx["l2_operation_working_set"] > capacity
+        assert 0.0 < deep_rd["a_cross_wave_miss_fraction"] < 1.0
+        assert 0.0 < deep_rd["b_cross_wave_miss_fraction"] < 1.0
+        assert deep_tx["dram_total"] > deep_tx["dram_unique"]
+
+        l2 = hardware.memory_levels["l2"]
+        resident_hardware = replace(
+            hardware,
+            memory_levels={
+                **hardware.memory_levels,
+                "l2": replace(
+                    l2,
+                    size_bytes=deep_tx["l2_operation_working_set"],
+                ),
+            },
+        )
+        resident = model.predict(_gemm(4096, 4096, 1024), resident_hardware)
+        resident_tx = resident.diagnostics["transaction_bytes"]
+        resident_rd = resident_tx["l2_reuse_distance"]
+        assert resident_rd["a_cross_wave_miss_fraction"] == 0.0
+        assert resident_rd["b_cross_wave_miss_fraction"] == 0.0
+        assert resident_tx["dram_total"] == resident_tx["dram_unique"]
+
+        constrained_hardware = replace(
+            hardware,
+            memory_levels={
+                **hardware.memory_levels,
+                "l2": replace(
+                    l2,
+                    size_bytes=deep_tx["l2_reuse_working_set"] // 2,
+                ),
+            },
+        )
+        constrained = model.predict(
+            _gemm(4096, 4096, 1024), constrained_hardware
+        )
+        constrained_tx = constrained.diagnostics["transaction_bytes"]
+        constrained_rd = constrained_tx["l2_reuse_distance"]
+        assert 0.0 < constrained_rd["a_cross_wave_miss_fraction"] <= 1.0
+        assert 0.0 < constrained_rd["b_cross_wave_miss_fraction"] <= 1.0
+        assert constrained_tx["dram_unique"] < constrained_tx["dram_total"]
+        observed_traffic.append(
+            (
+                constrained_tx["a_dram_read"],
+                constrained_tx["b_dram_read"],
+                constrained_tx["dram_total"],
+                constrained_tx["l2_capacity_miss_fraction"],
+            )
+        )
+    assert observed_traffic[0] == observed_traffic[1]
+
+def test_gemm_reports_output_writeback_at_l2() -> None:
+    hardware = load_hardware(HARDWARE)
+    profile = EffectiveRooflineModel().predict(_gemm(256, 512, 1024), hardware)
+    tx = profile.diagnostics["transaction_bytes"]
+
+    assert profile.memory_access.l2_write_bytes == tx["d_store"]
+    assert profile.memory_access.l2_write_bytes > 0
+
+
+def test_gemm_l2_reuse_footprint_is_wave_local_not_batch_global() -> None:
+    hardware = load_hardware(HARDWARE)
+
+    def batched_op(batch: int) -> LocalOp:
+        return LocalOp(
+            name=f"bmm_{batch}",
+            kind=OpKind.BATCHED_GEMM,
+            phase=Phase.INFERENCE,
+            attrs=_attrs(),
+            tensors=(
+                TensorSpec(TensorRole.INPUT, (batch, 2048, 32), DType.BF16),
+                TensorSpec(TensorRole.WEIGHT, (batch, 32, 2048), DType.BF16),
+                TensorSpec(TensorRole.OUTPUT, (batch, 2048, 2048), DType.BF16),
+            ),
+        )
+
+    single = ExtendedRooflineModel().predict(batched_op(1), hardware)
+    many = ExtendedRooflineModel().predict(batched_op(128), hardware)
+    single_tx = single.diagnostics["transaction_bytes"]
+    many_tx = many.diagnostics["transaction_bytes"]
+
+    assert single_tx["l2_reuse_working_set"] == many_tx["l2_reuse_working_set"]
+    assert single_tx["l2_reuse_working_set"] < hardware.memory_levels["l2"].size_bytes
+    assert single_tx["l2_capacity_miss_fraction"] == 0.0
+    assert many_tx["l2_capacity_miss_fraction"] == 0.0
+    assert many_tx["dram_unique"] == 128 * single_tx["dram_unique"]
+    assert many_tx["dram_total"] == many_tx["dram_unique"]
+
+
+def test_gemm_l2_capacity_fallbacks_and_broadcast_weight_working_set() -> None:
+    hardware = load_hardware(HARDWARE)
+    op = _gemm(512, 512, 512)
+    l2 = hardware.memory_levels["l2"]
+    missing_size = replace(
+        hardware,
+        memory_levels={**hardware.memory_levels, "l2": replace(l2, size_bytes=None)},
+    )
+    missing_profile = ExtendedRooflineModel().predict(op, missing_size)
+    missing_tx = missing_profile.diagnostics["transaction_bytes"]
+    assert missing_tx["dram_total"] == missing_tx["dram_unique"]
+    assert "l2_size_bytes_absent_dram_uses_unique_first_touch" in missing_profile.diagnostics[
+        "warnings"
+    ]
+
+    no_l2 = replace(
+        hardware,
+        memory_levels={
+            name: level
+            for name, level in hardware.memory_levels.items()
+            if name != "l2"
+        },
+        utilization=replace(
+            hardware.utilization,
+            memory={
+                name: value
+                for name, value in hardware.utilization.memory.items()
+                if name != "l2"
+            },
+        ),
+    )
+    no_l2_profile = ExtendedRooflineModel().predict(op, no_l2)
+    no_l2_tx = no_l2_profile.diagnostics["transaction_bytes"]
+    assert no_l2_tx["l2_capacity_miss_fraction"] == 1.0
+    assert no_l2_tx["a_dram_read"] == no_l2_tx["a_l2_requested"]
+    assert no_l2_tx["b_dram_read"] == no_l2_tx["b_l2_requested"]
+
+    batch = 4
+    broadcast_op = LocalOp(
+        name="broadcast_bmm",
+        kind=OpKind.BATCHED_GEMM,
+        phase=Phase.INFERENCE,
+        attrs=_attrs(),
+        tensors=(
+            TensorSpec(TensorRole.INPUT, (batch, 256, 256), DType.BF16),
+            TensorSpec(TensorRole.WEIGHT, (256, 256), DType.BF16),
+            TensorSpec(TensorRole.OUTPUT, (batch, 256, 256), DType.BF16),
+        ),
+    )
+    batched_op = LocalOp(
+        name="batched_bmm",
+        kind=OpKind.BATCHED_GEMM,
+        phase=Phase.INFERENCE,
+        attrs=_attrs(),
+        tensors=(
+            TensorSpec(TensorRole.INPUT, (batch, 256, 256), DType.BF16),
+            TensorSpec(TensorRole.WEIGHT, (batch, 256, 256), DType.BF16),
+            TensorSpec(TensorRole.OUTPUT, (batch, 256, 256), DType.BF16),
+        ),
+    )
+    broadcast = ExtendedRooflineModel().predict(broadcast_op, hardware)
+    batched = ExtendedRooflineModel().predict(batched_op, hardware)
+    assert batched.diagnostics["logical_bytes"]["b"] == (
+        batch * broadcast.diagnostics["logical_bytes"]["b"]
+    )
+    assert batched.diagnostics["transaction_bytes"]["l2_reuse_working_set"] > (
+        broadcast.diagnostics["transaction_bytes"]["l2_reuse_working_set"]
     )
 
 

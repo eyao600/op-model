@@ -10,6 +10,8 @@ dist/
 venv/
 validation_artifacts/*
 experiments/*
+!experiments/gemm_kernel_tradeoff/
+!experiments/gemm_kernel_tradeoff/*.py
 data/
 effective_roofline.md
 effective_roofline_flashattention_plan.md
@@ -18,3 +20,4 @@ precollected_database.tar.gz
 tests/*
 !tests/test_gemm_latency_validation.py
 !tests/test_effective_roofline.py
+!tests/test_gemm_kernel_tradeoff_experiment.py

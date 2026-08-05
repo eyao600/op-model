@@ -15,6 +15,10 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "pytest>=7.0",
+  "matplotlib>=3.8",
+]
+research = [
+  "matplotlib>=3.8",
 ]
 
 [project.scripts]

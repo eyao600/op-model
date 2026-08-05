@@ -1225,6 +1225,21 @@ def _performance_details_row(
         "dram_unique_transaction_bytes": _diagnostic_value(
             diagnostics, "transaction_bytes", "dram_unique"
         ),
+        "dram_capacity_miss_transaction_bytes": _diagnostic_value(
+            diagnostics, "transaction_bytes", "dram_capacity_miss"
+        ),
+        "dram_total_transaction_bytes": _diagnostic_value(
+            diagnostics, "transaction_bytes", "dram_total"
+        ),
+        "l2_capacity_bytes": _diagnostic_value(
+            diagnostics, "transaction_bytes", "l2_capacity"
+        ),
+        "l2_reuse_working_set_bytes": _diagnostic_value(
+            diagnostics, "transaction_bytes", "l2_reuse_working_set"
+        ),
+        "l2_capacity_miss_fraction": _diagnostic_value(
+            diagnostics, "transaction_bytes", "l2_capacity_miss_fraction"
+        ),
         "smem_read_transaction_bytes": smem_read,
         "smem_write_transaction_bytes": smem_write,
         "smem_total_transaction_bytes": smem_total,
@@ -2813,6 +2828,11 @@ _PERFORMANCE_DETAIL_CSV_FIELDS = (
     "logical_d_store_bytes",
     "l2_requested_transaction_bytes",
     "dram_unique_transaction_bytes",
+    "dram_capacity_miss_transaction_bytes",
+    "dram_total_transaction_bytes",
+    "l2_capacity_bytes",
+    "l2_reuse_working_set_bytes",
+    "l2_capacity_miss_fraction",
     "smem_read_transaction_bytes",
     "smem_write_transaction_bytes",
     "smem_total_transaction_bytes",

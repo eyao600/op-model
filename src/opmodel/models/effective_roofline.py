@@ -1144,8 +1144,10 @@ def _estimate_gemm_with_kernel(
 ) -> OpProfile:
     clock_hz = extended._clock_hz(hardware, warnings)
     grid = extended._grid_accounting(problem, kernel)
-    traffic = extended._traffic_accounting(problem, kernel, grid, hardware, warnings)
     occupancy = extended._occupancy(problem, kernel, grid, hardware, warnings)
+    traffic = extended._traffic_accounting(
+        problem, kernel, grid, occupancy, hardware, warnings
+    )
     timeline = _effective_timeline(
         problem, kernel, grid, traffic, occupancy, hardware, clock_hz, warnings
     )
@@ -1284,7 +1286,7 @@ def _effective_timeline(
         else 0.0
     )
     avg_dram = (
-        traffic.a_dram_unique_bytes + traffic.b_dram_unique_bytes
+        traffic.a_dram_read_bytes + traffic.b_dram_read_bytes
     ) / load_stage_count
 
     common = dict(
@@ -2103,7 +2105,7 @@ def _diagnostics(
     last_diag = _wave_diagnostics(timeline.last_wave)
     q_smem = traffic.smem_total_bytes + timeline.epilogue_smem_bytes
     q_l2 = traffic.l2_requested_bytes
-    q_dram = traffic.dram_unique_bytes
+    q_dram = traffic.dram_total_bytes
     useful = grid.useful_flops
     issued = (
         full_count * timeline.full_wave.issued_flops + timeline.last_wave.issued_flops
@@ -2235,10 +2237,40 @@ def _diagnostics(
             "b_l2_requested": traffic.b_l2_requested_bytes,
             "a_dram_unique": traffic.a_dram_unique_bytes,
             "b_dram_unique": traffic.b_dram_unique_bytes,
+            "a_dram_read": traffic.a_dram_read_bytes,
+            "b_dram_read": traffic.b_dram_read_bytes,
             "c_read": traffic.c_read_transaction_bytes,
             "d_store": traffic.d_store_transaction_bytes,
             "l2_requested": traffic.l2_requested_bytes,
+            "l2_capacity": traffic.l2_capacity_bytes,
+            "l2_operation_working_set": traffic.l2_operation_working_set_bytes,
+            "l2_reuse_working_set": traffic.l2_reuse_working_set_bytes,
+            "l2_weighted_reuse_working_set": (
+                traffic.l2_weighted_reuse_working_set_bytes
+            ),
+            "l2_capacity_miss_fraction": traffic.l2_capacity_miss_fraction,
+            "l2_k_window_stages": traffic.l2_k_window_stages,
+            "l2_k_window_count": traffic.l2_k_window_count,
+            "l2_reuse_windows": {
+                "full_wave_full_k": traffic.l2_full_wave_full_window_bytes,
+                "full_wave_tail_k": traffic.l2_full_wave_tail_window_bytes,
+                "last_wave_full_k": traffic.l2_last_wave_full_window_bytes,
+                "last_wave_tail_k": traffic.l2_last_wave_tail_window_bytes,
+            },
+            "l2_reuse_distance": {
+                "a_within_wave_repeated": traffic.a_within_wave_repeated_bytes,
+                "a_cross_wave_repeated": traffic.a_cross_wave_repeated_bytes,
+                "b_within_wave_repeated": traffic.b_within_wave_repeated_bytes,
+                "b_cross_wave_repeated": traffic.b_cross_wave_repeated_bytes,
+                "within_wave_miss_fraction": traffic.l2_within_wave_miss_fraction,
+                "a_cross_wave_bytes": traffic.a_cross_wave_reuse_distance_bytes,
+                "b_cross_wave_bytes": traffic.b_cross_wave_reuse_distance_bytes,
+                "a_cross_wave_miss_fraction": traffic.a_cross_wave_miss_fraction,
+                "b_cross_wave_miss_fraction": traffic.b_cross_wave_miss_fraction,
+            },
+            "dram_capacity_miss": traffic.dram_capacity_miss_bytes,
             "dram_unique": traffic.dram_unique_bytes,
+            "dram_total": traffic.dram_total_bytes,
             "smem_read": traffic.smem_read_bytes,
             "smem_write": traffic.smem_write_bytes,
             "epilogue_smem": timeline.epilogue_smem_bytes,
@@ -2324,6 +2356,10 @@ def _diagnostics(
             "four_smsps_per_sm_assumed",
             "l2_hbm_mainloop_overlap",
             "serial_epilogue_l2_plus_hbm",
+            "row_major_cta_launch_order_for_l2_reuse",
+            "representative_full_last_wave_k_window_l2_capacity_model",
+            "analytical_a_b_cross_wave_reuse_distance_buckets",
+            "bounded_l2_capacity_miss_approximation",
         ),
     }
 
